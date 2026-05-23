@@ -28,20 +28,23 @@ let selectedCoverImage = null; // { mime, base64 } 或 null
 
 // --- 事件监听 ---
 
-// 标签页切换
 tabDirect.addEventListener('click', () => switchTab('direct'));
 tabZip.addEventListener('click', () => switchTab('zip'));
 
-// 拖拽事件
 dropZones.forEach(zone => {
-    zone.addEventListener('dragover', (e) => {
+    zone.addEventListener('dragover', e => {
         e.preventDefault();
         zone.classList.add('dragover');
     });
-    zone.addEventListener('dragleave', (e) => zone.classList.remove('dragover'));
-    zone.addEventListener('drop', (e) => {
+
+    zone.addEventListener('dragleave', () => {
+        zone.classList.remove('dragover');
+    });
+
+    zone.addEventListener('drop', e => {
         e.preventDefault();
         zone.classList.remove('dragover');
+
         const files = e.dataTransfer.files;
         if (zone.parentElement.id === 'panel-direct') {
             handleDirectFiles(files);
@@ -51,17 +54,60 @@ dropZones.forEach(zone => {
     });
 });
 
-// 文件输入
-fileInputDirect.addEventListener('change', (e) => handleDirectFiles(e.target.files));
-fileInputZip.addEventListener('change', (e) => {
+fileInputDirect.addEventListener('change', e => {
+    handleDirectFiles(e.target.files);
+});
+
+fileInputZip.addEventListener('change', e => {
     if (e.target.files.length) handleZipFile(e.target.files[0]);
 });
 
-// 操作按钮
 convertBtn.addEventListener('click', convertAndDownload);
 clearBtn.addEventListener('click', clearFiles);
 
-// --- 功能函数 ---
+// --- 基础工具函数 ---
+
+function escapeHtml(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+function showStatusMessage(message) {
+    statusMessage.textContent = message;
+}
+
+function joinZipPath(folder, name) {
+    const cleanFolder = String(folder || '').replace(/^\/+|\/+$/g, '');
+    const cleanName = String(name || '').replace(/^\/+/g, '');
+
+    if (!cleanFolder) return cleanName;
+    if (!cleanName) return cleanFolder;
+
+    return `${cleanFolder}/${cleanName}`;
+}
+
+function getBaseName(path) {
+    return String(path).split('/').pop();
+}
+
+function isVttFile(filename) {
+    return /\.vtt$/i.test(filename);
+}
+
+function isMp3File(filename) {
+    return /\.mp3$/i.test(filename);
+}
+
+function isZipFile(file) {
+    if (!file) return false;
+    return file.type.includes('zip') || /\.zip$/i.test(file.name);
+}
+
+// --- 页面状态 ---
 
 function switchTab(tabName) {
     if (tabName === 'direct') {
@@ -77,14 +123,54 @@ function switchTab(tabName) {
         panelZip.classList.add('active');
         flattenOption.classList.remove('hidden');
     }
-     clearFiles(); // 切换时清空
+
+    clearFiles();
 }
 
-// 处理直接上传的 VTT 文件
-function handleDirectFiles(fileList) {
+function clearFiles() {
+    filesToProcess = [];
+    loadedZip = null;
+    originalInputName = null;
+    zipImages = [];
+    selectedCoverImage = null;
+
+    imagePreviewGrid.innerHTML = '';
+    imagePreviewContainer.classList.add('hidden');
+
+    fileInputDirect.value = '';
+    fileInputZip.value = '';
+
+    fileList.innerHTML = '';
+    fileListContainer.classList.add('hidden');
+    actionButtons.classList.add('hidden');
+
+    showStatusMessage('');
+    setButtonLoading(false);
+}
+
+function setButtonLoading(isLoading) {
+    if (isLoading) {
+        convertBtn.disabled = true;
+        btnText.classList.add('hidden');
+        spinner.classList.remove('hidden');
+    } else {
+        convertBtn.disabled = false;
+        btnText.classList.remove('hidden');
+        spinner.classList.add('hidden');
+    }
+}
+
+// --- 文件处理 ---
+
+function handleDirectFiles(inputFileList) {
     clearFiles();
-    const vttFiles = Array.from(fileList).filter(file => file.name.endsWith('.vtt'));
-    if (vttFiles.length === 0) return;
+
+    const vttFiles = Array.from(inputFileList).filter(file => isVttFile(file.name));
+
+    if (vttFiles.length === 0) {
+        showStatusMessage('请选择 .vtt 文件。');
+        return;
+    }
 
     originalInputName = vttFiles[0].name;
 
@@ -92,36 +178,43 @@ function handleDirectFiles(fileList) {
         name: file.name,
         getContent: () => file.text()
     }));
+
     updateFileListUI();
 }
 
-// 处理 ZIP 压缩包
 async function handleZipFile(zipFile) {
-    if (!zipFile || !(zipFile.type.includes('zip') || zipFile.name.endsWith('.zip'))) {
+    if (!isZipFile(zipFile)) {
         showStatusMessage('请上传一个 ZIP 格式的压缩包。');
         return;
     }
+
     clearFiles();
     originalInputName = zipFile.name;
 
     try {
-        loadedZip = await JSZip.loadAsync(zipFile); // 存储整个 ZIP 对象
+        loadedZip = await JSZip.loadAsync(zipFile);
+
         const vttZipEntries = [];
         let hasMp3 = false;
+
         for (const filename in loadedZip.files) {
             const entry = loadedZip.files[filename];
             if (entry.dir) continue;
-            if (filename.endsWith('.vtt')) {
+
+            if (isVttFile(filename)) {
                 vttZipEntries.push(entry);
             }
-            if (/\.mp3$/i.test(filename)) {
+
+            if (isMp3File(filename)) {
                 hasMp3 = true;
             }
         }
+
         filesToProcess = vttZipEntries.map(entry => ({
             name: entry.name,
             getContent: () => entry.async('string')
         }));
+
         updateFileListUI(hasMp3);
         await extractAndDisplayImages();
     } catch (error) {
@@ -139,85 +232,115 @@ function updateFileListUI(hasMp3 = false) {
             fileListContainer.classList.remove('hidden');
             actionButtons.classList.remove('hidden');
         } else {
-            showStatusMessage(`在上传的文件中未找到任何 .vtt 或 .mp3 文件。`);
+            showStatusMessage('在上传的文件中未找到任何 .vtt 或 .mp3 文件。');
             fileListContainer.classList.add('hidden');
             actionButtons.classList.add('hidden');
         }
         return;
     }
+
     fileList.innerHTML = '';
+
     filesToProcess.forEach(file => {
         const li = document.createElement('li');
         li.className = 'list-item flex items-center justify-between bg-gray-50 p-3 rounded-lg';
+
+        const safeName = escapeHtml(file.name);
+
         li.innerHTML = `
-            <span class="text-sm font-medium text-gray-700 truncate" title="${file.name}">${file.name}</span>
-            <span class="text-sm text-green-600">待处理</span>`;
+            <span class="text-sm font-medium text-gray-700 truncate" title="${safeName}">${safeName}</span>
+            <span class="text-sm text-green-600">待处理</span>
+        `;
+
         fileList.appendChild(li);
     });
+
     fileListContainer.classList.remove('hidden');
     actionButtons.classList.remove('hidden');
 }
 
-function showStatusMessage(message) {
-    statusMessage.textContent = message;
-}
-
-function clearFiles() {
-    filesToProcess = [];
-    loadedZip = null; // 清空已加载的 ZIP
-    originalInputName = null;
-    zipImages = [];
-    selectedCoverImage = null;
-    imagePreviewGrid.innerHTML = '';
-    imagePreviewContainer.classList.add('hidden');
-    fileInputDirect.value = '';
-    fileInputZip.value = '';
-    fileList.innerHTML = '';
-    fileListContainer.classList.add('hidden');
-    actionButtons.classList.add('hidden');
-    showStatusMessage('');
-}
+// --- VTT 转 LRC ---
 
 function convertVttToLrc(vttContent) {
-    const cleanContent = vttContent.replace(/^WEBVTT\s*/, '').replace(/NOTE\s.*\n/g, '').replace(/\r/g, '');
+    const cleanContent = String(vttContent)
+        .replace(/^\uFEFF/, '')
+        .replace(/^WEBVTT[^\n]*\n?/i, '')
+        .replace(/\r/g, '');
+
     const lines = cleanContent.split('\n');
     let lrcContent = '';
+
     for (let i = 0; i < lines.length; i++) {
-        if (lines[i].includes('-->')) {
-            const startTime = lines[i].split(' --> ')[0].trim();
-            const timeParts = startTime.split(/[:.]/);
-            if (timeParts.length < 3) continue;
-            const hours = timeParts.length > 3 ? parseInt(timeParts[0], 10) : 0;
-            const minutes = parseInt(timeParts[timeParts.length - 3], 10) || 0;
-            const seconds = parseInt(timeParts[timeParts.length - 2], 10) || 0;
-            const milliseconds = parseInt(timeParts[timeParts.length - 1], 10) || 0;
-            const totalMinutes = hours * 60 + minutes;
-            const hundredths = Math.floor(milliseconds / 10);
-            let text = '';
-            let j = i + 1;
-            while (j < lines.length && lines[j] && lines[j].trim() !== '') {
-                text += lines[j].trim() + ' ';
-                j++;
+        const line = lines[i].trim();
+
+        if (!line.includes('-->')) continue;
+
+        const startTime = line.split('-->')[0].trim();
+        const timestamp = convertVttTimeToLrcTime(startTime);
+
+        if (!timestamp) continue;
+
+        let text = '';
+        let j = i + 1;
+
+        while (j < lines.length && lines[j].trim() !== '') {
+            const subtitleLine = lines[j].trim();
+
+            // 跳过常见 VTT 标签和 NOTE 块
+            if (!/^NOTE\b/i.test(subtitleLine)) {
+                text += subtitleLine + ' ';
             }
-            text = text.trim();
-            i = j - 1;
-            if (text) {
-                const lrcTimestamp = `[${String(totalMinutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(hundredths).padStart(2, '0')}]`;
-                lrcContent += `${lrcTimestamp}${text}\n`;
-            }
+
+            j++;
+        }
+
+        text = cleanupSubtitleText(text.trim());
+        i = j - 1;
+
+        if (text) {
+            lrcContent += `${timestamp}${text}\n`;
         }
     }
+
     return lrcContent;
 }
 
+function convertVttTimeToLrcTime(vttTime) {
+    // 支持：
+    // 00:01.234
+    // 01:02:03.456
+    const match = String(vttTime).match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})$/);
+
+    if (!match) return null;
+
+    const hours = parseInt(match[1] || '0', 10);
+    const minutes = parseInt(match[2] || '0', 10);
+    const seconds = parseInt(match[3] || '0', 10);
+    const milliseconds = parseInt((match[4] || '0').padEnd(3, '0'), 10);
+
+    const totalMinutes = hours * 60 + minutes;
+    const hundredths = Math.floor(milliseconds / 10);
+
+    return `[${String(totalMinutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(hundredths).padStart(2, '0')}]`;
+}
+
+function cleanupSubtitleText(text) {
+    return String(text)
+        .replace(/<[^>]+>/g, '') // 去掉 VTT 简单标签
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
 function getLrcFilename(vttFilename) {
-    if (vttFilename.endsWith('.mp3.vtt')) {
-        return vttFilename.replace('.mp3.vtt', '.lrc');
+    if (/\.mp3\.vtt$/i.test(vttFilename)) {
+        return vttFilename.replace(/\.mp3\.vtt$/i, '.lrc');
     }
-    if (vttFilename.endsWith('.wav.vtt')) {
-        return vttFilename.replace('.wav.vtt', '.lrc');
+
+    if (/\.wav\.vtt$/i.test(vttFilename)) {
+        return vttFilename.replace(/\.wav\.vtt$/i, '.lrc');
     }
-    return vttFilename.replace(/.vtt$/, '.lrc');
+
+    return vttFilename.replace(/\.vtt$/i, '.lrc');
 }
 
 // --- 图片预览与封面选择 ---
@@ -225,20 +348,37 @@ function getLrcFilename(vttFilename) {
 async function extractAndDisplayImages() {
     zipImages = [];
     selectedCoverImage = null;
+
     const imageExts = /\.(jpe?g|png|gif|webp|bmp)$/i;
     const mimeMap = {
-        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
-        gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp'
+        jpg: 'image/jpeg',
+        jpeg: 'image/jpeg',
+        png: 'image/png',
+        gif: 'image/gif',
+        webp: 'image/webp',
+        bmp: 'image/bmp'
     };
 
     for (const filename in loadedZip.files) {
         const entry = loadedZip.files[filename];
+
         if (entry.dir || !imageExts.test(filename)) continue;
+
         const ext = filename.split('.').pop().toLowerCase();
         const mime = mimeMap[ext];
+
         if (!mime) continue;
-        const base64 = await entry.async('base64');
-        zipImages.push({ name: filename, mime, base64 });
+
+        try {
+            const base64 = await entry.async('base64');
+            zipImages.push({
+                name: filename,
+                mime,
+                base64
+            });
+        } catch (error) {
+            console.warn(`读取图片失败：${filename}`, error);
+        }
     }
 
     renderImageGrid();
@@ -246,6 +386,7 @@ async function extractAndDisplayImages() {
 
 function renderImageGrid() {
     imagePreviewGrid.innerHTML = '';
+
     if (zipImages.length === 0) {
         imagePreviewContainer.classList.add('hidden');
         return;
@@ -254,12 +395,20 @@ function renderImageGrid() {
     zipImages.forEach((img, index) => {
         const wrapper = document.createElement('div');
         wrapper.className = 'image-thumb-wrapper';
-        wrapper.dataset.index = index;
+        wrapper.dataset.index = String(index);
         wrapper.title = img.name;
-        wrapper.innerHTML = `
-            <img src="data:${img.mime};base64,${img.base64}" alt="${img.name}">
-            <div class="cover-check">✓</div>
-        `;
+
+        const image = document.createElement('img');
+        image.src = `data:${img.mime};base64,${img.base64}`;
+        image.alt = img.name;
+
+        const check = document.createElement('div');
+        check.className = 'cover-check';
+        check.textContent = '✓';
+
+        wrapper.appendChild(image);
+        wrapper.appendChild(check);
+
         wrapper.addEventListener('click', () => selectCoverImage(index));
         imagePreviewGrid.appendChild(wrapper);
     });
@@ -276,219 +425,592 @@ function selectCoverImage(index) {
         return;
     }
 
-    wrappers.forEach(w => w.classList.remove('selected'));
+    wrappers.forEach(wrapper => wrapper.classList.remove('selected'));
     wrappers[index].classList.add('selected');
-    selectedCoverImage = { mime: zipImages[index].mime, base64: zipImages[index].base64 };
+
+    selectedCoverImage = {
+        mime: zipImages[index].mime,
+        base64: zipImages[index].base64
+    };
+}
+
+// --- 图片标准化：解决手机播放器不识别大图/Exif/非方图的问题 ---
+
+async function normalizeCoverImage(imageBase64, imageMime, options = {}) {
+    const maxSize = options.maxSize || 800;
+    const quality = options.quality || 0.85;
+
+    const blob = base64ToBlob(imageBase64, imageMime);
+    const bitmap = await loadImageBitmapCompatible(blob);
+
+    const sourceWidth = bitmap.width;
+    const sourceHeight = bitmap.height;
+
+    if (!sourceWidth || !sourceHeight) {
+        throw new Error('无法读取封面图片尺寸。');
+    }
+
+    // 居中裁剪为正方形
+    const cropSize = Math.min(sourceWidth, sourceHeight);
+    const cropX = Math.floor((sourceWidth - cropSize) / 2);
+    const cropY = Math.floor((sourceHeight - cropSize) / 2);
+
+    // 限制最大尺寸
+    const targetSize = Math.min(maxSize, cropSize);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = targetSize;
+    canvas.height = targetSize;
+
+    const ctx = canvas.getContext('2d', {
+        alpha: false
+    });
+
+    // 填白底，避免 PNG/WebP 透明区域转 JPEG 后变黑
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, targetSize, targetSize);
+
+    ctx.drawImage(
+        bitmap,
+        cropX,
+        cropY,
+        cropSize,
+        cropSize,
+        0,
+        0,
+        targetSize,
+        targetSize
+    );
+
+    const jpegBlob = await new Promise(resolve => {
+        canvas.toBlob(resolve, 'image/jpeg', quality);
+    });
+
+    if (!jpegBlob) {
+        throw new Error('封面图片转换为 JPEG 失败。');
+    }
+
+    const normalizedBase64 = await blobToBase64(jpegBlob);
+
+    return {
+        mime: 'image/jpeg',
+        base64: normalizedBase64,
+        originalWidth: sourceWidth,
+        originalHeight: sourceHeight,
+        outputSize: targetSize,
+        byteLength: jpegBlob.size
+    };
+}
+
+function base64ToBlob(base64, mime) {
+    const binaryStr = atob(base64);
+    const bytes = new Uint8Array(binaryStr.length);
+
+    for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+    }
+
+    return new Blob([bytes], {
+        type: mime
+    });
+}
+
+function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = () => {
+            const result = String(reader.result || '');
+            const commaIndex = result.indexOf(',');
+            resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+        };
+
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+    });
+}
+
+async function loadImageBitmapCompatible(blob) {
+    if ('createImageBitmap' in window) {
+        return await createImageBitmap(blob);
+    }
+
+    return await new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(blob);
+        const image = new Image();
+
+        image.onload = () => {
+            URL.revokeObjectURL(url);
+            resolve(image);
+        };
+
+        image.onerror = () => {
+            URL.revokeObjectURL(url);
+            reject(new Error('图片解码失败。'));
+        };
+
+        image.src = url;
+    });
+}
+
+// --- ID3v2 读写工具 ---
+
+function readSynchsafeInt(bytes, offset) {
+    return (
+        ((bytes[offset] & 0x7F) << 21) |
+        ((bytes[offset + 1] & 0x7F) << 14) |
+        ((bytes[offset + 2] & 0x7F) << 7) |
+        (bytes[offset + 3] & 0x7F)
+    );
+}
+
+function writeSynchsafeInt(value) {
+    return new Uint8Array([
+        (value >> 21) & 0x7F,
+        (value >> 14) & 0x7F,
+        (value >> 7) & 0x7F,
+        value & 0x7F
+    ]);
+}
+
+function readUint32BE(bytes, offset) {
+    return (
+        (bytes[offset] << 24) |
+        (bytes[offset + 1] << 16) |
+        (bytes[offset + 2] << 8) |
+        bytes[offset + 3]
+    ) >>> 0;
+}
+
+function writeUint32BE(value) {
+    return new Uint8Array([
+        (value >>> 24) & 0xFF,
+        (value >>> 16) & 0xFF,
+        (value >>> 8) & 0xFF,
+        value & 0xFF
+    ]);
+}
+
+function hasId3v2Tag(bytes) {
+    return bytes.length >= 10 &&
+        bytes[0] === 0x49 &&
+        bytes[1] === 0x44 &&
+        bytes[2] === 0x33;
+}
+
+function parseId3v2(bytes) {
+    if (!hasId3v2Tag(bytes)) {
+        return {
+            hasTag: false,
+            majorVersion: null,
+            revision: null,
+            flags: 0,
+            tagStart: 0,
+            tagEnd: 0,
+            frameData: new Uint8Array(0),
+            audioStart: 0
+        };
+    }
+
+    const majorVersion = bytes[3];
+    const revision = bytes[4];
+    const flags = bytes[5];
+    const tagSize = readSynchsafeInt(bytes, 6);
+
+    let tagEnd = 10 + tagSize;
+
+    // ID3v2 footer
+    if (flags & 0x10) {
+        tagEnd += 10;
+    }
+
+    tagEnd = Math.min(tagEnd, bytes.length);
+
+    return {
+        hasTag: true,
+        majorVersion,
+        revision,
+        flags,
+        tagStart: 0,
+        tagEnd,
+        frameData: bytes.slice(10, Math.min(10 + tagSize, bytes.length)),
+        audioStart: tagEnd
+    };
+}
+
+function removeApicFramesFromId3v23(frameData) {
+    const keptFrames = [];
+    let offset = 0;
+
+    while (offset + 10 <= frameData.length) {
+        const frameId = String.fromCharCode(
+            frameData[offset],
+            frameData[offset + 1],
+            frameData[offset + 2],
+            frameData[offset + 3]
+        );
+
+        // padding
+        if (!/^[A-Z0-9]{4}$/.test(frameId)) {
+            break;
+        }
+
+        const frameSize = readUint32BE(frameData, offset + 4);
+        const frameTotalSize = 10 + frameSize;
+
+        if (frameSize <= 0 || offset + frameTotalSize > frameData.length) {
+            break;
+        }
+
+        if (frameId !== 'APIC') {
+            keptFrames.push(frameData.slice(offset, offset + frameTotalSize));
+        }
+
+        offset += frameTotalSize;
+    }
+
+    return concatUint8Arrays(keptFrames);
+}
+
+function createTextFrameV23(frameId, text) {
+    const textBytes = new TextEncoder().encode(String(text || ''));
+    const frameContent = new Uint8Array(1 + textBytes.length);
+
+    frameContent[0] = 0x03; // UTF-8。虽然 ID3v2.3 标准里更常见 UTF-16，但多数现代播放器能识别
+    frameContent.set(textBytes, 1);
+
+    return createFrameV23(frameId, frameContent);
+}
+
+function createApicFrameV23(imageBytes, imageMime) {
+    const mimeTypeBytes = new TextEncoder().encode(imageMime || 'image/jpeg');
+
+    // APIC content:
+    // text encoding: 1 byte
+    // MIME: n bytes
+    // null terminator: 1 byte
+    // picture type: 1 byte
+    // description null terminator: 1 byte
+    // image data: n bytes
+    const frameContentSize = 1 + mimeTypeBytes.length + 1 + 1 + 1 + imageBytes.length;
+    const frameContent = new Uint8Array(frameContentSize);
+
+    let offset = 0;
+
+    frameContent[offset++] = 0x00; // ISO-8859-1，描述为空，所以最兼容
+    frameContent.set(mimeTypeBytes, offset);
+    offset += mimeTypeBytes.length;
+    frameContent[offset++] = 0x00; // MIME null
+    frameContent[offset++] = 0x03; // Front Cover
+    frameContent[offset++] = 0x00; // empty description
+    frameContent.set(imageBytes, offset);
+
+    return createFrameV23('APIC', frameContent);
+}
+
+function createFrameV23(frameId, frameContent) {
+    const frame = new Uint8Array(10 + frameContent.length);
+    const frameIdBytes = new TextEncoder().encode(frameId);
+
+    frame.set(frameIdBytes, 0);
+    frame.set(writeUint32BE(frameContent.length), 4);
+
+    frame[8] = 0x00;
+    frame[9] = 0x00;
+
+    frame.set(frameContent, 10);
+
+    return frame;
+}
+
+function createId3v23Tag(frames) {
+    const frameData = concatUint8Arrays(frames);
+    const header = new Uint8Array(10);
+
+    header[0] = 0x49; // I
+    header[1] = 0x44; // D
+    header[2] = 0x33; // 3
+    header[3] = 0x03; // ID3v2.3
+    header[4] = 0x00;
+    header[5] = 0x00;
+
+    header.set(writeSynchsafeInt(frameData.length), 6);
+
+    return concatUint8Arrays([header, frameData]);
+}
+
+function concatUint8Arrays(arrays) {
+    const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+    const result = new Uint8Array(totalLength);
+
+    let offset = 0;
+
+    arrays.forEach(arr => {
+        result.set(arr, offset);
+        offset += arr.length;
+    });
+
+    return result;
+}
+
+function base64ToUint8Array(base64) {
+    const binaryStr = atob(base64);
+    const bytes = new Uint8Array(binaryStr.length);
+
+    for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+    }
+
+    return bytes;
 }
 
 // --- ID3v2 封面写入 ---
+// 重点改进：
+// 1. 写入前把封面压缩成 800x800 JPEG
+// 2. 对 ID3v2.3 文件尽量保留原标签，只替换 APIC
+// 3. 非 ID3v2.3 或无标签时，写入一个新的 ID3v2.3 标签
 
-function addId3v2Cover(mp3ArrayBuffer, imageBase64, imageMime) {
-    // 解码 base64 图片
-    const binaryStr = atob(imageBase64);
-    const imageBytes = new Uint8Array(binaryStr.length);
-    for (let i = 0; i < binaryStr.length; i++) {
-        imageBytes[i] = binaryStr.charCodeAt(i);
-    }
+async function addId3v2Cover(mp3ArrayBuffer, imageBase64, imageMime, metadata = {}) {
+    const normalizedCover = await normalizeCoverImage(imageBase64, imageMime, {
+        maxSize: 800,
+        quality: 0.85
+    });
 
+    const imageBytes = base64ToUint8Array(normalizedCover.base64);
     const mp3Bytes = new Uint8Array(mp3ArrayBuffer);
+    const parsed = parseId3v2(mp3Bytes);
+    const audioBytes = mp3Bytes.slice(parsed.audioStart);
 
-    // 剥离已有 ID3v2 标签
-    let mp3StartOffset = 0;
-    if (mp3Bytes[0] === 0x49 && mp3Bytes[1] === 0x44 && mp3Bytes[2] === 0x33) {
-        const tagSize =
-            ((mp3Bytes[6] & 0x7F) << 21) |
-            ((mp3Bytes[7] & 0x7F) << 14) |
-            ((mp3Bytes[8] & 0x7F) << 7) |
-            ((mp3Bytes[9] & 0x7F));
-        mp3StartOffset = 10 + tagSize;
-        if (mp3Bytes[5] & 0x10) mp3StartOffset += 10; // footer
+    const apicFrame = createApicFrameV23(imageBytes, normalizedCover.mime);
+
+    let frames = [];
+
+    if (parsed.hasTag && parsed.majorVersion === 3) {
+        // 保留原 ID3v2.3 的非 APIC 帧，只替换封面
+        const keptFrameData = removeApicFramesFromId3v23(parsed.frameData);
+
+        frames.push(keptFrameData);
+
+        // 如原标签里完全缺少基础信息，可按文件名补一个标题
+        if (metadata.title) {
+            // 为了避免重复 TIT2，这里不强行补写。
+            // 需要强制补标题时，可以在这里添加 createTextFrameV23('TIT2', metadata.title)
+        }
+
+        frames.push(apicFrame);
+    } else {
+        // 没有 ID3v2 标签，或版本不是 v2.3：新建一个兼容性较好的 ID3v2.3 标签
+        if (metadata.title) {
+            frames.push(createTextFrameV23('TIT2', metadata.title));
+        }
+
+        frames.push(apicFrame);
     }
-    const mp3WithoutId3 = mp3Bytes.slice(mp3StartOffset);
 
-    // 构建 APIC frame
-    const mimeTypeBytes = new TextEncoder().encode(imageMime);
-    // frame content: encoding(1) + mime + null(1) + picType(1) + desc null(1) + imageData
-    const frameContentSize = 1 + mimeTypeBytes.length + 1 + 1 + 1 + imageBytes.length;
-    const apicFrame = new Uint8Array(10 + frameContentSize);
+    const id3Tag = createId3v23Tag(frames);
+    const result = new Uint8Array(id3Tag.length + audioBytes.length);
 
-    // Frame ID: "APIC"
-    apicFrame[0] = 0x41; apicFrame[1] = 0x50; apicFrame[2] = 0x49; apicFrame[3] = 0x43;
-    // Frame size (big-endian, 非 syncsafe)
-    apicFrame[4] = (frameContentSize >> 24) & 0xFF;
-    apicFrame[5] = (frameContentSize >> 16) & 0xFF;
-    apicFrame[6] = (frameContentSize >> 8) & 0xFF;
-    apicFrame[7] = frameContentSize & 0xFF;
-    // Flags
-    apicFrame[8] = 0x00; apicFrame[9] = 0x00;
-
-    let offset = 10;
-    apicFrame[offset++] = 0x00; // encoding: ISO-8859-1
-    apicFrame.set(mimeTypeBytes, offset); offset += mimeTypeBytes.length;
-    apicFrame[offset++] = 0x00; // null terminator for MIME
-    apicFrame[offset++] = 0x03; // picture type: front cover
-    apicFrame[offset++] = 0x00; // description: empty
-    apicFrame.set(imageBytes, offset);
-
-    // ID3v2.3 tag header
-    const tagSize = apicFrame.length;
-    const id3Header = new Uint8Array(10);
-    id3Header[0] = 0x49; id3Header[1] = 0x44; id3Header[2] = 0x33; // "ID3"
-    id3Header[3] = 3; id3Header[4] = 0; // v2.3.0
-    id3Header[5] = 0; // flags
-    id3Header[6] = (tagSize >> 21) & 0x7F;
-    id3Header[7] = (tagSize >> 14) & 0x7F;
-    id3Header[8] = (tagSize >> 7) & 0x7F;
-    id3Header[9] = tagSize & 0x7F;
-
-    // 拼接：header + APIC frame + stripped MP3
-    const result = new Uint8Array(id3Header.length + apicFrame.length + mp3WithoutId3.length);
-    result.set(id3Header, 0);
-    result.set(apicFrame, id3Header.length);
-    result.set(mp3WithoutId3, id3Header.length + apicFrame.length);
+    result.set(id3Tag, 0);
+    result.set(audioBytes, id3Tag.length);
 
     return result.buffer;
 }
 
+// --- ZIP 输出辅助 ---
+
+function getOutputFolderNameFromZip(zip) {
+    let fallback = '';
+
+    if (originalInputName) {
+        fallback = originalInputName.replace(/\.zip$/i, '');
+    }
+
+    for (const fn in zip.files) {
+        if (zip.files[fn].dir) continue;
+
+        const parts = fn.split('/').filter(Boolean);
+        const dirParts = parts.slice(0, -1);
+
+        if (dirParts.length >= 2) {
+            return `${dirParts[0]}_${dirParts[1]}`;
+        }
+
+        if (dirParts.length === 1) {
+            return dirParts[0];
+        }
+
+        break;
+    }
+
+    return fallback || 'output';
+}
+
+function createFlattenedName(filename, existingNames) {
+    const baseName = getBaseName(filename);
+    const parts = filename.split('/').filter(Boolean);
+
+    // 路径部分：去掉第一个根目录和最后一个文件名
+    const pathParts = parts.slice(1, -1);
+    const hasPath = pathParts.length > 0;
+    const pathStr = pathParts.join('_');
+
+    const isMusicOrSubtitle = /\.(mp3|wav|lrc|ogg|flac|aac|m4a)$/i.test(baseName);
+
+    let newName = baseName;
+
+    if (existingNames.has(newName)) {
+        if (isMusicOrSubtitle && hasPath) {
+            newName = baseName.replace(/\.[^.]+$/, `_${pathStr}$&`);
+        } else if (!isMusicOrSubtitle && hasPath) {
+            newName = `${pathStr}_${baseName}`;
+        } else {
+            newName = addNumberSuffixUntilUnique(baseName, existingNames);
+        }
+    }
+
+    if (existingNames.has(newName)) {
+        newName = addNumberSuffixUntilUnique(newName, existingNames);
+    }
+
+    existingNames.add(newName);
+
+    return newName;
+}
+
+function addNumberSuffixUntilUnique(filename, existingNames) {
+    const dotIndex = filename.lastIndexOf('.');
+    const nameBase = dotIndex > 0 ? filename.slice(0, dotIndex) : filename;
+    const extPart = dotIndex > 0 ? filename.slice(dotIndex) : '';
+
+    let counter = 2;
+    let candidate = `${nameBase}_${counter}${extPart}`;
+
+    while (existingNames.has(candidate)) {
+        counter++;
+        candidate = `${nameBase}_${counter}${extPart}`;
+    }
+
+    return candidate;
+}
+
+// --- 转换与下载 ---
+
 async function convertAndDownload() {
     if (filesToProcess.length === 0 && !loadedZip) return;
+
     setButtonLoading(true);
+    showStatusMessage('');
+
     try {
         const outputZip = new JSZip();
 
         if (loadedZip) {
-            // 模式一：处理上传的 ZIP 包
-            const shouldFlatten = flattenCheckbox.checked;
-            const existingNames = new Set();
-
-            // 从 ZIP 结构中提取输出文件夹名（前两层目录合并）
-            let outputFolder = '';
-            for (const fn in loadedZip.files) {
-                if (loadedZip.files[fn].dir) continue;
-                const parts = fn.split('/');
-                const dirParts = parts.slice(0, -1);
-                if (dirParts.length >= 2) {
-                    outputFolder = dirParts[0] + '_' + dirParts[1];
-                } else if (dirParts.length === 1) {
-                    outputFolder = dirParts[0];
-                }
-                break;
-            }
-
-            for (const filename in loadedZip.files) {
-                const zipEntry = loadedZip.files[filename];
-                if (zipEntry.dir) continue;
-
-                let newName;
-
-                if (shouldFlatten) {
-                    const baseName = filename.split('/').pop();
-                    const parts = filename.split('/');
-                    // 路径部分：去掉第一个（根目录如 RJ01524070）和最后一个（文件名）
-                    const pathParts = parts.slice(1, -1);
-                    const hasPath = pathParts.length > 0;
-                    const pathStr = pathParts.join('_');
-                    const isMusicOrSubtitle = /\.(mp3|wav|lrc|ogg|flac|aac|m4a)$/i.test(baseName);
-
-                    if (existingNames.has(baseName)) {
-                        if (isMusicOrSubtitle && hasPath) {
-                            newName = baseName.replace(/\.[^.]+$/, `_${pathStr}$&`);
-                        } else if (!isMusicOrSubtitle && hasPath) {
-                            newName = `${pathStr}_${baseName}`;
-                        } else {
-                            // 无法区分的重名：加序号
-                            let counter = 1;
-                            let candidate;
-                            do {
-                                counter++;
-                                candidate = baseName.replace(/([^.]+)/, `$1_${counter}`);
-                            } while (existingNames.has(candidate));
-                            newName = candidate;
-                        }
-                    } else {
-                        newName = baseName;
-                    }
-
-                    // 处理重命名后仍然重名的情况（加序号）
-                    if (existingNames.has(newName)) {
-                        let counter = 1;
-                        let candidate;
-                        do {
-                            counter++;
-                            const ext = newName.lastIndexOf('.');
-                            const nameBase = ext > 0 ? newName.substring(0, ext) : newName;
-                            const extPart = ext > 0 ? newName.substring(ext) : '';
-                            candidate = `${nameBase}_${counter}${extPart}`;
-                        } while (existingNames.has(candidate));
-                        newName = candidate;
-                    }
-
-                    existingNames.add(newName);
-                } else {
-                    newName = filename;
-                }
-
-                if (filename.endsWith('.vtt')) {
-                    const vttContent = await zipEntry.async('string');
-                    const lrcContent = convertVttToLrc(vttContent);
-                    const lrcFilename = shouldFlatten ? getLrcFilename(newName) : getLrcFilename(filename);
-                    outputZip.file(outputFolder + '/' + lrcFilename, lrcContent);
-                } else if (/\.mp3$/i.test(filename) && selectedCoverImage) {
-                    const arrayBuffer = await zipEntry.async('arraybuffer');
-                    const taggedBuffer = addId3v2Cover(arrayBuffer, selectedCoverImage.base64, selectedCoverImage.mime);
-                    outputZip.file(outputFolder + '/' + newName, new Blob([taggedBuffer], { type: 'audio/mpeg' }));
-                } else {
-                    const fileContent = await zipEntry.async('blob');
-                    outputZip.file(outputFolder + '/' + newName, fileContent);
-                }
-            }
+            await processZipMode(outputZip);
         } else {
-            // 模式二：处理直接上传的 VTT 文件
-            for (const file of filesToProcess) {
-                const vttContent = await file.getContent();
-                const lrcContent = convertVttToLrc(vttContent);
-                const lrcFilename = getLrcFilename(file.name);
-                outputZip.file(lrcFilename, lrcContent);
-            }
+            await processDirectVttMode(outputZip);
         }
 
-        const zipBlob = await outputZip.generateAsync({ type: 'blob' });
-        const downloadUrl = URL.createObjectURL(zipBlob);
-        const a = document.createElement('a');
-        a.href = downloadUrl;
+        const zipBlob = await outputZip.generateAsync({
+            type: 'blob'
+        });
 
-        let downloadName = `converted_lrc_${Date.now()}.zip`; // Fallback name
-        if (loadedZip && originalInputName) {
-            // ZIP mode
-            const baseName = originalInputName.replace(/\.zip$/i, '');
-            downloadName = `${baseName}_after.zip`;
-        } else if (!loadedZip && originalInputName) {
-            // Direct VTTs mode
-            const baseName = originalInputName.replace(/\.vtt$/i, '');
-            downloadName = `${baseName}等等.zip`;
-        }
-        a.download = downloadName;
-
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(downloadUrl);
+        downloadBlob(zipBlob, getDownloadName());
+        showStatusMessage('处理完成。');
     } catch (error) {
         console.error('转换或下载过程中发生错误:', error);
-        showStatusMessage('处理失败，请在控制台查看错误信息。');
+        showStatusMessage(`处理失败：${error.message || '请在控制台查看错误信息。'}`);
     } finally {
         setButtonLoading(false);
     }
 }
 
-function setButtonLoading(isLoading) {
-     if (isLoading) {
-        convertBtn.disabled = true;
-        btnText.classList.add('hidden');
-        spinner.classList.remove('hidden');
-     } else {
-        convertBtn.disabled = false;
-        btnText.classList.remove('hidden');
-        spinner.classList.add('hidden');
-     }
+async function processZipMode(outputZip) {
+    const shouldFlatten = flattenCheckbox.checked;
+    const existingNames = new Set();
+    const outputFolder = getOutputFolderNameFromZip(loadedZip);
+
+    for (const filename in loadedZip.files) {
+        const zipEntry = loadedZip.files[filename];
+        if (zipEntry.dir) continue;
+
+        const newName = shouldFlatten
+            ? createFlattenedName(filename, existingNames)
+            : filename;
+
+        if (isVttFile(filename)) {
+            const vttContent = await zipEntry.async('string');
+            const lrcContent = convertVttToLrc(vttContent);
+            const lrcFilename = shouldFlatten
+                ? getLrcFilename(newName)
+                : getLrcFilename(filename);
+
+            outputZip.file(joinZipPath(outputFolder, lrcFilename), lrcContent);
+            continue;
+        }
+
+        if (isMp3File(filename) && selectedCoverImage) {
+            const arrayBuffer = await zipEntry.async('arraybuffer');
+
+            const metadata = {
+                title: getBaseName(newName).replace(/\.[^.]+$/, '')
+            };
+
+            const taggedBuffer = await addId3v2Cover(
+                arrayBuffer,
+                selectedCoverImage.base64,
+                selectedCoverImage.mime,
+                metadata
+            );
+
+            outputZip.file(
+                joinZipPath(outputFolder, newName),
+                new Blob([taggedBuffer], {
+                    type: 'audio/mpeg'
+                })
+            );
+
+            continue;
+        }
+
+        const fileContent = await zipEntry.async('blob');
+        outputZip.file(joinZipPath(outputFolder, newName), fileContent);
+    }
+}
+
+async function processDirectVttMode(outputZip) {
+    for (const file of filesToProcess) {
+        const vttContent = await file.getContent();
+        const lrcContent = convertVttToLrc(vttContent);
+        const lrcFilename = getLrcFilename(file.name);
+
+        outputZip.file(lrcFilename, lrcContent);
+    }
+}
+
+function getDownloadName() {
+    let downloadName = `converted_lrc_${Date.now()}.zip`;
+
+    if (loadedZip && originalInputName) {
+        const baseName = originalInputName.replace(/\.zip$/i, '');
+        downloadName = `${baseName}_after.zip`;
+    } else if (!loadedZip && originalInputName) {
+        const baseName = originalInputName.replace(/\.vtt$/i, '');
+        downloadName = `${baseName}等等.zip`;
+    }
+
+    return downloadName;
+}
+
+function downloadBlob(blob, filename) {
+    const downloadUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+
+    a.href = downloadUrl;
+    a.download = filename;
+
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    URL.revokeObjectURL(downloadUrl);
 }
