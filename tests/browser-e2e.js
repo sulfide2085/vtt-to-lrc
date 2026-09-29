@@ -118,6 +118,37 @@ function findBrowser() {
     });
 }
 
+/**
+ * 清空下载目录。
+ * 注意：Chrome 自己会往"配置的下载目录"里写东西（实测无头模式下会落一个
+ * downloads.htm，内容是组件更新的 CRX 包，打开 example.com 也一样出现），
+ * 所以测试必须按期望的文件名去找，不能"抓到第一个文件就算数"。
+ */
+function clearDownloadDir(dir) {
+    for (const name of fs.readdirSync(dir)) {
+        try {
+            fs.rmSync(path.join(dir, name), { force: true });
+        } catch {
+            // Chrome 可能还占着 .crdownload 句柄，忽略
+        }
+    }
+}
+
+/** 等一个文件名以 expectedSuffix 结尾的下载完成 */
+async function waitForDownload(dir, expectedSuffix, attempts = 200) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+        const matches = fs.readdirSync(dir)
+            .filter(name => !name.endsWith('.crdownload') && name.endsWith(expectedSuffix))
+            .sort();
+
+        if (matches.length) return path.join(dir, matches[0]);
+
+        await sleep(200);
+    }
+
+    return null;
+}
+
 /** 极简 CDP 客户端 */
 class Cdp {
     constructor(url) {
@@ -369,8 +400,8 @@ async function main() {
 
         let ready = await waitForDeps(100);
 
-        if (!ready) {
-            console.log('（依赖未就绪，重新加载页面再试一次…）');
+        for (let reloadAttempt = 0; reloadAttempt < 3 && !ready; reloadAttempt++) {
+            console.log(`（依赖未就绪，第 ${reloadAttempt + 1} 次重载页面重试…）`);
 
             const reloaded = pageCdp.once('Page.loadEventFired');
 
@@ -379,9 +410,13 @@ async function main() {
             ready = await waitForDeps(150);
         }
 
+        if (!ready) {
+            // 直接中止：否则后面几十项都会因为编码库缺失而失败，看不出真正原因
+            throw new Error('CDN 依赖（lamejs / JSZip / Tailwind）加载失败，属网络问题而非页面缺陷，本次测试中止');
+        }
+
         console.log('\n[1] 页面与依赖加载');
-        check('lamejs / audio.js / JSZip 均已就绪', ready === true, '依赖未加载完成');
-        check('只剩两个标签页（WAV 单页已移除）', await evaluate(pageCdp, `document.querySelectorAll('.tab-btn').length === 2 && document.getElementById('tab-audio') === null && document.getElementById('panel-audio') === null`));
+        check('lamejs / audio.js / JSZip 均已就绪', ready === true, '依赖未加载完成');        check('只剩两个标签页（WAV 单页已移除）', await evaluate(pageCdp, `document.querySelectorAll('.tab-btn').length === 2 && document.getElementById('tab-audio') === null && document.getElementById('panel-audio') === null`));
         check('界面不再提供码率选择', await evaluate(pageCdp, 'document.getElementById("mp3-bitrate") === null'));
         check('页脚有 GitHub 仓库链接', await evaluate(pageCdp, `(() => {
             const link = document.querySelector('footer a[href*="github.com"]');
@@ -395,7 +430,7 @@ async function main() {
         // --- 2. ZIP 模式：真实点击 + 真实下载，并把下载到的压缩包拆开检查 ---
         console.log('\n[2] ZIP 模式（真实点击 + 真实下载，解包校验内容）');
 
-        fs.readdirSync(downloadDir).forEach(name => fs.rmSync(path.join(downloadDir, name), { force: true }));
+        clearDownloadDir(downloadDir);
 
         await evaluate(pageCdp, `(async () => {
             ${MAKE_WAV_SOURCE}
@@ -414,18 +449,7 @@ async function main() {
             return true;
         })()`);
 
-        let downloadedZip = null;
-
-        for (let attempt = 0; attempt < 150; attempt++) {
-            const entries = fs.readdirSync(downloadDir).filter(name => !name.endsWith('.crdownload'));
-
-            if (entries.length) {
-                downloadedZip = path.join(downloadDir, entries[0]);
-                break;
-            }
-
-            await sleep(200);
-        }
+        const downloadedZip = await waitForDownload(downloadDir, '下载测试_after.zip');
 
         check('点击按钮后浏览器真的下载了文件', !!downloadedZip);
 
@@ -756,7 +780,7 @@ async function main() {
         // 结果最后一个音频没有封面，下载名也退化成 converted_lrc_时间戳.zip。
         console.log('\n[10] 转换中切标签 / 清空不应破坏正在进行的任务');
 
-        fs.readdirSync(downloadDir).forEach(name => fs.rmSync(path.join(downloadDir, name), { force: true }));
+        clearDownloadDir(downloadDir);
 
         const midRunResult = await evaluate(pageCdp, `(async () => {
             ${MAKE_WAV_SOURCE}
@@ -822,19 +846,8 @@ async function main() {
         check('转换中标签按钮被禁用', midRunResult.tabButtonsDisabled === true);
         check('转换中「清空」按钮被禁用', midRunResult.clearDisabled === true);
 
-        // 等下载落地
-        let midRunFile = null;
-
-        for (let attempt = 0; attempt < 200; attempt++) {
-            const entries = fs.readdirSync(downloadDir).filter(name => !name.endsWith('.crdownload'));
-
-            if (entries.length) {
-                midRunFile = path.join(downloadDir, entries[0]);
-                break;
-            }
-
-            await sleep(200);
-        }
+        // 等下载落地（按期望文件名匹配，避开 Chrome 自己写进去的 downloads.htm）
+        const midRunFile = await waitForDownload(downloadDir, '中途切标签_after.zip');
 
         check('转换完成后仍然正常下载', !!midRunFile, '没有等到下载文件');
 
@@ -842,9 +855,10 @@ async function main() {
             const zipBytes = fs.readFileSync(midRunFile);
             const entries = readZipEntries(zipBytes);
             const mp3Entries = entries.filter(entry => entry.name.endsWith('.mp3'));
+            const diagnostic = `文件名=${path.basename(midRunFile)} 大小=${zipBytes.length}B 头=${zipBytes.subarray(0, 4).toString('hex')} 条目=${JSON.stringify(entries.map(entry => entry.name))} 目录=${JSON.stringify(fs.readdirSync(downloadDir))}`;
 
-            check('下载名没有被退化成 converted_lrc_时间戳（状态快照生效）', path.basename(midRunFile) === '中途切标签_after.zip', `实际 ${path.basename(midRunFile)}`);
-            check('3 个音频都转码出来了', mp3Entries.length === 3, JSON.stringify(entries.map(entry => entry.name)));
+            check('下载名没有被退化成 converted_lrc_时间戳（状态快照生效）', path.basename(midRunFile) === '中途切标签_after.zip', diagnostic);
+            check('3 个音频都转码出来了', mp3Entries.length === 3, diagnostic);
 
             const withoutCover = mp3Entries.filter(entry => {
                 const bytes = entry.data;
@@ -912,6 +926,38 @@ async function main() {
             '切到 ZIP 标签后 ZIP 选项区真的显示出来',
             await evaluate(pageCdp, '!document.getElementById("zip-options").classList.contains("hidden")')
         );
+
+        // --- 12. 访问统计（GoatCounter）只在线上真的生效 ---
+        // 线上必须发出 /count 请求，否则统计数据会静默丢失；
+        // 本地 file:// 则必须不发，避免开发时污染线上数据。
+        console.log('\n[12] 访问统计（GoatCounter）');
+
+        await pageCdp.send('Network.enable');
+
+        const analyticsRequests = [];
+
+        pageCdp.on('Network.requestWillBeSent', params => {
+            if (params.request && params.request.url.includes('goatcounter.com/count')) {
+                analyticsRequests.push(params.request.url);
+            }
+        });
+
+        const reloadedForAnalytics = pageCdp.once('Page.loadEventFired');
+
+        await pageCdp.send('Page.reload', { ignoreCache: true });
+        await reloadedForAnalytics;
+        await sleep(4000);
+
+        if (TARGET_URL.startsWith('http')) {
+            check('线上页面会向 GoatCounter 上报访问', analyticsRequests.length >= 1, JSON.stringify(analyticsRequests));
+            check(
+                '上报到 vtt-to-lrc 这个账号',
+                analyticsRequests.length > 0 && analyticsRequests.every(url => url.startsWith('https://vtt-to-lrc.goatcounter.com/count')),
+                JSON.stringify(analyticsRequests)
+            );
+        } else {
+            check('本地 file:// 打开不会上报（不污染线上数据）', analyticsRequests.length === 0, JSON.stringify(analyticsRequests));
+        }
     } finally {
         pageCdp?.close();
         browserCdp?.close();
