@@ -469,7 +469,7 @@ async function main() {
             const buttonLabel = document.getElementById('btn-text').textContent;
 
             const output = new JSZip();
-            await processZipMode(output);
+            await processZipMode(output, createJob());
 
             const names = Object.keys(output.files).filter(name => !output.files[name].dir).sort();
             const mp3Entry = names.find(name => name.endsWith('歌曲一.mp3'));
@@ -506,7 +506,7 @@ async function main() {
 
             const note = document.getElementById('zip-wav-note');
             const output = new JSZip();
-            await processZipMode(output);
+            await processZipMode(output, createJob());
 
             return {
                 note: note ? note.textContent : null,
@@ -533,7 +533,7 @@ async function main() {
             input.dispatchEvent(new Event('change', { bubbles: true }));
 
             const output = new JSZip();
-            await processDirectVttMode(output);
+            await processDirectVttMode(output, createJob());
 
             return {
                 status: document.getElementById('status-message').textContent,
@@ -570,7 +570,7 @@ async function main() {
             checkbox.dispatchEvent(new Event('change', { bubbles: true }));
 
             const output = new JSZip();
-            const result = await processZipMode(output);
+            const result = await processZipMode(output, createJob());
 
             return {
                 warnings: result.warnings,
@@ -603,7 +603,7 @@ async function main() {
             await handleZipFile(new File([blob], '专辑包.zip', { type: 'application/zip' }));
 
             const output = new JSZip();
-            await processZipMode(output);
+            await processZipMode(output, createJob());
 
             const names = Object.keys(output.files).filter(name => !output.files[name].dir).sort();
             const lrcStems = names.filter(n => n.endsWith('.lrc')).map(n => n.replace(/\\.lrc$/, ''));
@@ -672,7 +672,7 @@ async function main() {
             const coverSelected = !!selectedCoverImage;
 
             const output = new JSZip();
-            await processZipMode(output);
+            await processZipMode(output, createJob());
 
             const mp3Name = Object.keys(output.files).find(name => name.endsWith('.mp3'));
             const bytes = mp3Name ? await output.file(mp3Name).async('uint8array') : new Uint8Array(0);
@@ -718,7 +718,7 @@ async function main() {
             await handleZipFile(new File([blob], '反斜杠包.zip', { type: 'application/zip' }));
 
             const output = new JSZip();
-            await processZipMode(output);
+            await processZipMode(output, createJob());
 
             const names = Object.keys(output.files).filter(name => !output.files[name].dir).sort();
             const mp3Bytes = names.filter(n => n.endsWith('.mp3')).length
@@ -743,10 +743,119 @@ async function main() {
         );
         check('反斜杠包转出来的 MP3 帧头正确', backslashResult.header && backslashResult.header.bitrate === 320, JSON.stringify(backslashResult.header));
 
-        // --- 10. 窄屏下标签都要能被真实鼠标点到 ---
+        // --- 10. 转换过程中切标签 / 清空，不能把正在跑的任务搞坏 ---
+        // 线上真实事故：音声包转码中途切标签，clearFiles() 把封面快照清掉，
+        // 结果最后一个音频没有封面，下载名也退化成 converted_lrc_时间戳.zip。
+        console.log('\n[10] 转换中切标签 / 清空不应破坏正在进行的任务');
+
+        fs.readdirSync(downloadDir).forEach(name => fs.rmSync(path.join(downloadDir, name), { force: true }));
+
+        const midRunResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+
+            const indexOfBytes = (haystack, needle) => {
+                outer: for (let i = 0; i + needle.length <= haystack.length; i++) {
+                    for (let j = 0; j < needle.length; j++) {
+                        if (haystack[i + j] !== needle[j]) continue outer;
+                    }
+                    return i;
+                }
+                return -1;
+            };
+            const ascii = text => Array.from(text).map(char => char.charCodeAt(0));
+
+            const canvas = document.createElement('canvas');
+            canvas.width = 300;
+            canvas.height = 300;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#00ff00';
+            ctx.fillRect(0, 0, 300, 300);
+            const jpegBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+            const jpegBytes = new Uint8Array(await jpegBlob.arrayBuffer());
+
+            // 3 个音频 + 1 张封面，足够长以便在转换中途动手
+            const source = new JSZip();
+            source.file('音声/1.wav', makeTestWav({ frames: 44100 * 3, freq: 440 }));
+            source.file('音声/2.wav', makeTestWav({ frames: 44100 * 3, freq: 550 }));
+            source.file('音声/3.wav', makeTestWav({ frames: 44100 * 3, freq: 660 }));
+            source.file('音声/封面.jpg', jpegBytes);
+
+            const blob = await source.generateAsync({ type: 'blob' });
+
+            switchTab('zip');
+            document.getElementById('transcode-wav-checkbox').checked = true;
+            await handleZipFile(new File([blob], '中途切标签.zip', { type: 'application/zip' }));
+
+            const wrapper = document.querySelector('#image-preview-grid .image-thumb-wrapper');
+            if (wrapper) wrapper.click();
+
+            // 开始转换（不 await），随后立刻模拟用户切标签 + 清空
+            const running = convertAndDownload();
+
+            await new Promise(resolve => setTimeout(resolve, 120));
+
+            const tabBefore = currentTab;
+            switchTab('direct');
+
+            const refusedTabSwitch = currentTab === tabBefore;
+            const tabButtonsDisabled = [...document.querySelectorAll('.tab-btn')].every(tab => tab.disabled);
+            const clearDisabled = document.getElementById('clear-btn').disabled;
+
+            // 再强行调用 clearFiles()：模拟其它路径把界面状态清掉。
+            // 任务用的是自己的快照，理论上不受影响。
+            clearFiles();
+
+            await running;
+
+            return { refusedTabSwitch, tabButtonsDisabled, clearDisabled };
+        })()`);
+
+        check('转换中切标签被拒绝', midRunResult.refusedTabSwitch === true);
+        check('转换中标签按钮被禁用', midRunResult.tabButtonsDisabled === true);
+        check('转换中「清空」按钮被禁用', midRunResult.clearDisabled === true);
+
+        // 等下载落地
+        let midRunFile = null;
+
+        for (let attempt = 0; attempt < 200; attempt++) {
+            const entries = fs.readdirSync(downloadDir).filter(name => !name.endsWith('.crdownload'));
+
+            if (entries.length) {
+                midRunFile = path.join(downloadDir, entries[0]);
+                break;
+            }
+
+            await sleep(200);
+        }
+
+        check('转换完成后仍然正常下载', !!midRunFile, '没有等到下载文件');
+
+        if (midRunFile) {
+            const zipBytes = fs.readFileSync(midRunFile);
+            const entries = readZipEntries(zipBytes);
+            const mp3Entries = entries.filter(entry => entry.name.endsWith('.mp3'));
+
+            check('下载名没有被退化成 converted_lrc_时间戳（状态快照生效）', path.basename(midRunFile) === '中途切标签_after.zip', `实际 ${path.basename(midRunFile)}`);
+            check('3 个音频都转码出来了', mp3Entries.length === 3, JSON.stringify(entries.map(entry => entry.name)));
+
+            const withoutCover = mp3Entries.filter(entry => {
+                const bytes = entry.data;
+
+                return !(bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) ||
+                    !bytes.includes(Buffer.from('APIC'));
+            });
+
+            check(
+                `每个 MP3 都带封面（缺封面的：${withoutCover.length} 个）`,
+                withoutCover.length === 0,
+                JSON.stringify(withoutCover.map(entry => entry.name))
+            );
+        }
+
+        // --- 11. 窄屏下标签都要能被真实鼠标点到 ---
         // 只点 element.click() 会掩盖"被 overflow-hidden 裁掉"这类问题，
         // 所以这里缩到 320px 宽并用 CDP 派发真实鼠标事件。
-        console.log('\n[10] 窄屏 320px 下用真实鼠标点击标签页');
+        console.log('\n[11] 窄屏 320px 下用真实鼠标点击标签页');
 
         await pageCdp.send('Emulation.setDeviceMetricsOverride', {
             width: 320,

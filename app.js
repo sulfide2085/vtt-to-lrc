@@ -34,6 +34,7 @@ let selectedCoverImage = null; // { mime, base64 } 或 null
 let currentTab = 'direct'; // direct | zip
 let zipHasMp3 = false; // 包内是否有 MP3（用于文件列表提示）
 let zipWavCount = 0; // 包内 WAV 数量
+let isProcessing = false; // 正在转换中：禁止切标签/清空/换文件，避免打断正在跑的任务
 
 // 固定 320 kbps：WAV 是无损 PCM，等效码率（CD 音质约 1411 kbps）远高于 320，
 // 没有"源码率"可继承，所以一律按 320 kbps 编码；只有采样率过低时
@@ -225,6 +226,11 @@ function updateLameStatus() {
 // --- 页面状态 ---
 
 function switchTab(tabName) {
+    if (isProcessing) {
+        showStatusMessage('正在转换中，请等当前任务完成后再切换标签。');
+        return;
+    }
+
     currentTab = tabName;
 
     Object.keys(TAB_ELEMENTS).forEach(name => {
@@ -279,9 +285,34 @@ function setButtonLoading(isLoading) {
     }
 }
 
+/**
+ * 转换期间锁住会重置状态的入口（切标签 / 清空 / 重新选文件）。
+ * 以前切标签会触发 clearFiles()，把正在跑的任务依赖的封面、包对象一起清掉，
+ * 结果就是"后面的文件没封面"、下载名退化成 converted_lrc_时间戳.zip。
+ */
+function setProcessing(processing) {
+    isProcessing = processing;
+
+    convertBtn.disabled = processing;
+    clearBtn.disabled = processing;
+
+    Object.keys(TAB_ELEMENTS).forEach(name => {
+        const tab = TAB_ELEMENTS[name].tab;
+
+        tab.disabled = processing;
+        tab.classList.toggle('opacity-50', processing);
+        tab.classList.toggle('cursor-not-allowed', processing);
+    });
+}
+
 // --- 文件处理 ---
 
 function handleDirectFiles(inputFileList) {
+    if (isProcessing) {
+        showStatusMessage('正在转换中，请等当前任务完成后再选择文件。');
+        return;
+    }
+
     // 必须先快照：clearFiles() 会把 input.value 置空，
     // 而 Chrome 返回的 FileList 是"实时"的同一个对象，置空后它也会变空
     const selectedFiles = Array.from(inputFileList);
@@ -306,6 +337,11 @@ function handleDirectFiles(inputFileList) {
 }
 
 async function handleZipFile(zipFile) {
+    if (isProcessing) {
+        showStatusMessage('正在转换中，请等当前任务完成后再选择文件。');
+        return;
+    }
+
     if (!isZipFile(zipFile)) {
         showStatusMessage('请上传一个 ZIP 格式的压缩包。');
         return;
@@ -990,11 +1026,11 @@ async function addId3v2Cover(mp3ArrayBuffer, imageBase64, imageMime, metadata = 
 
 // --- ZIP 输出辅助 ---
 
-function getOutputFolderNameFromZip(zip) {
+function getOutputFolderNameFromZip(zip, zipFileName) {
     let fallback = '';
 
-    if (originalInputName) {
-        fallback = originalInputName.replace(/\.zip$/i, '');
+    if (zipFileName) {
+        fallback = zipFileName.replace(/\.zip$/i, '');
     }
 
     for (const fn in zip.files) {
@@ -1076,24 +1112,48 @@ function addNumberSuffixUntilUnique(filename, existingNames) {
 
 // --- 转换与下载 ---
 
+/**
+ * 把当前界面状态冻结成一份任务快照。
+ * 转换要跑很久（音声包可能几十分钟），期间运行中的任务只认这份快照，
+ * 不再实时读全局变量，这样任何界面状态变化都不会影响正在进行的转换。
+ */
+function createJob() {
+    const isZipMode = !!loadedZip;
+
+    return {
+        isZipMode,
+        zip: loadedZip,
+        files: filesToProcess,
+        zipName: originalInputName,
+        coverImage: selectedCoverImage, // 封面快照，最关键的一项
+        shouldFlatten: flattenCheckbox.checked,
+        shouldTranscodeWav: transcodeWavCheckbox.checked,
+        bitrate: MP3_BITRATE
+    };
+}
+
 async function convertAndDownload() {
+    if (isProcessing) return;
     if (filesToProcess.length === 0 && !loadedZip) return;
 
+    const job = createJob();
+
+    setProcessing(true);
     setButtonLoading(true);
     showStatusMessage('');
 
     try {
         const outputZip = new JSZip();
 
-        const result = loadedZip
-            ? await processZipMode(outputZip)
-            : await processDirectVttMode(outputZip);
+        const result = job.isZipMode
+            ? await processZipMode(outputZip, job)
+            : await processDirectVttMode(outputZip, job);
 
         const zipBlob = await outputZip.generateAsync({
             type: 'blob'
         });
 
-        downloadBlob(zipBlob, getDownloadName());
+        downloadBlob(zipBlob, getDownloadName(job));
 
         const warnings = (result && result.warnings) || [];
 
@@ -1106,6 +1166,7 @@ async function convertAndDownload() {
         console.error('转换或下载过程中发生错误:', error);
         showStatusMessage(`处理失败：${error.message || '请在控制台查看错误信息。'}`);
     } finally {
+        setProcessing(false);
         setButtonLoading(false);
         hideProgress();
     }
@@ -1113,11 +1174,11 @@ async function convertAndDownload() {
 
 // --- ZIP 模式内的 WAV 转码 ---
 
-function countZipWavFiles() {
+function countZipWavFiles(zip) {
     let count = 0;
 
-    for (const filename in loadedZip.files) {
-        if (!loadedZip.files[filename].dir && isWavFile(filename)) {
+    for (const filename in zip.files) {
+        if (!zip.files[filename].dir && isWavFile(filename)) {
             count++;
         }
     }
@@ -1135,31 +1196,32 @@ function uniqueOutputName(candidate, takenNames) {
     return name;
 }
 
-async function processZipMode(outputZip) {
-    const shouldFlatten = flattenCheckbox.checked;
-    const shouldTranscodeWav = transcodeWavCheckbox.checked;
-    const bitrate = MP3_BITRATE;
+async function processZipMode(outputZip, job) {
+    const shouldFlatten = job.shouldFlatten;
+    const shouldTranscodeWav = job.shouldTranscodeWav;
+    const bitrate = job.bitrate;
+    const coverImage = job.coverImage; // 用快照，避免中途被 clearFiles 清掉
     const existingNames = new Set();
-    const outputFolder = getOutputFolderNameFromZip(loadedZip);
+    const outputFolder = getOutputFolderNameFromZip(job.zip, job.zipName);
 
     // 非平铺模式保留原始路径，先把所有原始文件名登记下来，
     // 免得转码出来的 MP3 覆盖掉包内同名的 MP3
     const reservedNames = new Set();
 
     if (!shouldFlatten) {
-        for (const filename in loadedZip.files) {
-            if (!loadedZip.files[filename].dir) {
+        for (const filename in job.zip.files) {
+            if (!job.zip.files[filename].dir) {
                 reservedNames.add(filename);
             }
         }
     }
 
-    const wavCount = shouldTranscodeWav ? countZipWavFiles() : 0;
+    const wavCount = shouldTranscodeWav ? countZipWavFiles(job.zip) : 0;
     const warnings = [];
     let wavIndex = 0;
 
-    for (const filename in loadedZip.files) {
-        const zipEntry = loadedZip.files[filename];
+    for (const filename in job.zip.files) {
+        const zipEntry = job.zip.files[filename];
         if (zipEntry.dir) continue;
 
         const newName = shouldFlatten
@@ -1202,13 +1264,13 @@ async function processZipMode(outputZip) {
 
                 let outputBuffer = result.data.buffer;
 
-                if (selectedCoverImage) {
+                if (coverImage) {
                     setProgress((wavIndex - 0.02) / wavCount, `转码 WAV ${label} — 正在写入封面…`);
 
                     outputBuffer = await addId3v2Cover(
                         outputBuffer,
-                        selectedCoverImage.base64,
-                        selectedCoverImage.mime,
+                        coverImage.base64,
+                        coverImage.mime,
                         {
                             title: getBaseName(filename).replace(/\.[^.]+$/, '')
                         }
@@ -1231,7 +1293,7 @@ async function processZipMode(outputZip) {
             continue;
         }
 
-        if (isMp3File(filename) && selectedCoverImage) {
+        if (isMp3File(filename) && coverImage) {
             const arrayBuffer = await zipEntry.async('arraybuffer');
 
             const metadata = {
@@ -1240,8 +1302,8 @@ async function processZipMode(outputZip) {
 
             const taggedBuffer = await addId3v2Cover(
                 arrayBuffer,
-                selectedCoverImage.base64,
-                selectedCoverImage.mime,
+                coverImage.base64,
+                coverImage.mime,
                 metadata
             );
 
@@ -1262,8 +1324,8 @@ async function processZipMode(outputZip) {
     return { warnings };
 }
 
-async function processDirectVttMode(outputZip) {
-    for (const file of filesToProcess) {
+async function processDirectVttMode(outputZip, job) {
+    for (const file of job.files) {
         const vttContent = await file.getContent();
         const lrcContent = convertVttToLrc(vttContent);
         const lrcFilename = getLrcFilename(file.name);
@@ -1272,14 +1334,14 @@ async function processDirectVttMode(outputZip) {
     }
 }
 
-function getDownloadName() {
+function getDownloadName(job) {
     let downloadName = `converted_lrc_${Date.now()}.zip`;
 
-    if (loadedZip && originalInputName) {
-        const baseName = originalInputName.replace(/\.zip$/i, '');
+    if (job.isZipMode && job.zipName) {
+        const baseName = job.zipName.replace(/\.zip$/i, '');
         downloadName = `${baseName}_after.zip`;
-    } else if (!loadedZip && originalInputName) {
-        const baseName = originalInputName.replace(/\.vtt$/i, '');
+    } else if (!job.isZipMode && job.zipName) {
+        const baseName = job.zipName.replace(/\.vtt$/i, '');
         downloadName = `${baseName}等等.zip`;
     }
 

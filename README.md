@@ -34,6 +34,9 @@ python -m http.server 8080
 
 > 打包方式没有限制：资源管理器右键「压缩到 zip」、7-Zip、`Compress-Archive` 都可以。
 > 资源管理器打的包用反斜杠记路径，工具会自动修正。
+>
+> 转换过程中标签页会锁定（按钮变灰），避免中途切标签打断任务。音声包动辄几十分钟，
+> 请保持页面打开。
 
 ## WAV 转 MP3 说明
 
@@ -63,7 +66,7 @@ tests/browser-e2e.js     — 真实浏览器端到端测试（需要本机 Chrom
 
 ```bash
 node tests/wav-to-mp3.test.js   # 19 项：解析、位深、重采样、码率收敛、MP3 帧头
-node tests/browser-e2e.js       # 51 项：真实 Chrome 驱动页面，含真实下载解包、ID3 封面、Windows 压缩包与窄屏点击
+node tests/browser-e2e.js       # 58 项：真实 Chrome 驱动页面，含真实下载解包、ID3 封面、中途切标签、Windows 压缩包与窄屏点击
 
 # 也可以直接测线上站点（部署后冒烟验证）
 node tests/browser-e2e.js https://sulfide2085.github.io/vtt-to-lrc/
