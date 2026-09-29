@@ -17,6 +17,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const zlib = require('zlib');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const LOCAL_URL = `file:///${path.join(PROJECT_ROOT, 'index.html').replace(/\\/g, '/')}`;
@@ -35,6 +36,77 @@ const CHROME_CANDIDATES = [
 ].filter(Boolean);
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/** 解开浏览器下载下来的 ZIP（JSZip 默认用 deflate，够用了，不支持 ZIP64） */
+function readZipEntries(buffer) {
+    let eocd = -1;
+
+    for (let i = buffer.length - 22; i >= 0 && i > buffer.length - 22 - 65536; i--) {
+        if (buffer.readUInt32LE(i) === 0x06054b50) {
+            eocd = i;
+            break;
+        }
+    }
+
+    if (eocd < 0) throw new Error('不是有效的 ZIP（找不到 EOCD）');
+
+    const count = buffer.readUInt16LE(eocd + 10);
+    let offset = buffer.readUInt32LE(eocd + 16);
+    const entries = [];
+
+    for (let i = 0; i < count; i++) {
+        if (buffer.readUInt32LE(offset) !== 0x02014b50) break;
+
+        const method = buffer.readUInt16LE(offset + 10);
+        const compressedSize = buffer.readUInt32LE(offset + 20);
+        const nameLength = buffer.readUInt16LE(offset + 28);
+        const extraLength = buffer.readUInt16LE(offset + 30);
+        const commentLength = buffer.readUInt16LE(offset + 32);
+        const localOffset = buffer.readUInt32LE(offset + 42);
+        const name = buffer.subarray(offset + 46, offset + 46 + nameLength).toString('utf8');
+
+        const localNameLength = buffer.readUInt16LE(localOffset + 26);
+        const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+        const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+        const raw = buffer.subarray(dataStart, dataStart + compressedSize);
+
+        entries.push({
+            name,
+            data: method === 8 ? zlib.inflateRawSync(raw) : Buffer.from(raw)
+        });
+
+        offset += 46 + nameLength + extraLength + commentLength;
+    }
+
+    return entries;
+}
+
+/** Node 侧的 MP3 帧头解析，和页面里的 readMp3Header 保持一致 */
+function readMp3HeaderBuffer(bytes) {
+    for (let i = 0; i + 4 <= bytes.length; i++) {
+        if (bytes[i] !== 0xff || (bytes[i + 1] & 0xe0) !== 0xe0) continue;
+
+        const versionBits = (bytes[i + 1] >> 3) & 0x03;
+        const layerBits = (bytes[i + 1] >> 1) & 0x03;
+        const bitrateIndex = (bytes[i + 2] >> 4) & 0x0f;
+        const rateIndex = (bytes[i + 2] >> 2) & 0x03;
+        const modeBits = (bytes[i + 3] >> 6) & 0x03;
+        const rates = { 3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000] }[versionBits];
+        const bitratesV1 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+        const bitratesV2 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+
+        if (!rates || layerBits !== 1) continue;
+
+        return {
+            mpeg: versionBits === 3 ? 1 : versionBits === 2 ? 2 : 2.5,
+            sampleRate: rates[rateIndex],
+            bitrate: (versionBits === 3 ? bitratesV1 : bitratesV2)[bitrateIndex],
+            mode: ['stereo', 'joint', 'dual', 'mono'][modeBits]
+        };
+    }
+
+    return null;
+}
 
 function findBrowser() {
     return CHROME_CANDIDATES.find(candidate => {
@@ -309,63 +381,69 @@ async function main() {
 
         console.log('\n[1] 页面与依赖加载');
         check('lamejs / audio.js / JSZip 均已就绪', ready === true, '依赖未加载完成');
+        check('只剩两个标签页（WAV 单页已移除）', await evaluate(pageCdp, `document.querySelectorAll('.tab-btn').length === 2 && document.getElementById('tab-audio') === null && document.getElementById('panel-audio') === null`));
         check('界面不再提供码率选择', await evaluate(pageCdp, 'document.getElementById("mp3-bitrate") === null'));
 
-        // --- 2. WAV 转 MP3 标签页：真实点击 + 真实下载 ---
-        console.log('\n[2] WAV 转 MP3 标签页（真实点击 + 真实下载）');
+        // --- 2. ZIP 模式：真实点击 + 真实下载，并把下载到的压缩包拆开检查 ---
+        console.log('\n[2] ZIP 模式（真实点击 + 真实下载，解包校验内容）');
 
-        await evaluate(pageCdp, `(() => {
+        fs.readdirSync(downloadDir).forEach(name => fs.rmSync(path.join(downloadDir, name), { force: true }));
+
+        await evaluate(pageCdp, `(async () => {
             ${MAKE_WAV_SOURCE}
-            const wav = makeTestWav({ frames: 44100 });
-            const file = new File([wav], '测试歌曲.wav', { type: 'audio/wav' });
-            const transfer = new DataTransfer();
-            transfer.items.add(file);
-            document.getElementById('tab-audio').click();
-            const input = document.getElementById('file-input-audio');
-            input.files = transfer.files;
-            input.dispatchEvent(new Event('change', { bubbles: true }));
+
+            const source = new JSZip();
+            source.file('作品/歌曲.wav', makeTestWav({ frames: 22050 }));
+            source.file('作品/歌曲.wav.vtt', 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n测试歌词\\n');
+
+            const blob = await source.generateAsync({ type: 'blob' });
+
+            switchTab('zip');
+            document.getElementById('transcode-wav-checkbox').checked = true;
+            await handleZipFile(new File([blob], '下载测试.zip', { type: 'application/zip' }));
+            document.getElementById('convert-btn').click();
+
             return true;
         })()`);
 
-        check('选择 WAV 后显示待转码列表', await evaluate(pageCdp, '!document.getElementById("file-list-container").classList.contains("hidden")'));
-        check('按钮文案切换为「转码并下载 MP3」', (await evaluate(pageCdp, 'document.getElementById("btn-text").textContent')).includes('转码并下载 MP3'));
-        check('选项区显示且隐藏了 ZIP 专用开关', await evaluate(pageCdp, `!document.getElementById('audio-options').classList.contains('hidden') && document.getElementById('transcode-option').classList.contains('hidden')`));
-
-        await evaluate(pageCdp, 'document.getElementById("convert-btn").click()');
-
-        // 等下载完成
-        let downloaded = null;
+        let downloadedZip = null;
 
         for (let attempt = 0; attempt < 150; attempt++) {
             const entries = fs.readdirSync(downloadDir).filter(name => !name.endsWith('.crdownload'));
 
             if (entries.length) {
-                downloaded = path.join(downloadDir, entries[0]);
+                downloadedZip = path.join(downloadDir, entries[0]);
                 break;
             }
 
             await sleep(200);
         }
 
-        check('点击按钮后浏览器真的下载了文件', !!downloaded);
+        check('点击按钮后浏览器真的下载了文件', !!downloadedZip);
 
-        if (downloaded) {
-            const bytes = fs.readFileSync(downloaded);
-            const header = await evaluate(pageCdp, `(() => {
-                ${READ_MP3_HEADER_SOURCE}
-                return readMp3Header(new Uint8Array([${Array.from(bytes.slice(0, 4096)).join(',')}]));
-            })()`);
+        if (downloadedZip) {
+            const zipBytes = fs.readFileSync(downloadedZip);
+            const entries = readZipEntries(zipBytes);
+            const names = entries.map(entry => entry.name).sort();
+            const mp3Entry = entries.find(entry => entry.name.endsWith('.mp3'));
+            const lrcEntry = entries.find(entry => entry.name.endsWith('.lrc'));
 
-            check(`下载文件名是「${path.basename(downloaded)}」`, path.basename(downloaded) === '测试歌曲.mp3', `实际 ${path.basename(downloaded)}`);
-            check('输出是 MPEG-1 Layer III', header && header.mpeg === 1, JSON.stringify(header));
+            check(`下载的是「${path.basename(downloadedZip)}」`, path.basename(downloadedZip) === '下载测试_after.zip', `实际 ${path.basename(downloadedZip)}`);
+            check('下载内容是可解析的 ZIP', entries.length > 0, JSON.stringify(names));
+            check('压缩包里是 MP3 + LRC', !!mp3Entry && !!lrcEntry, JSON.stringify(names));
+            check('MP3 与 LRC 同名', mp3Entry && lrcEntry && mp3Entry.name.replace(/\.mp3$/, '') === lrcEntry.name.replace(/\.lrc$/, ''), `${mp3Entry?.name} / ${lrcEntry?.name}`);
+            check('LRC 内容正确', lrcEntry && lrcEntry.data.toString('utf8') === '[00:00.00]测试歌词\n', JSON.stringify(lrcEntry?.data.toString('utf8')));
+
+            const header = mp3Entry ? readMp3HeaderBuffer(mp3Entry.data) : null;
+
+            check('MP3 是 MPEG-1 Layer III', header && header.mpeg === 1, JSON.stringify(header));
             check('码率 320 kbps', header && header.bitrate === 320, JSON.stringify(header));
             check('采样率 44100 Hz', header && header.sampleRate === 44100, JSON.stringify(header));
             check('立体声', header && header.mode !== 'mono', JSON.stringify(header));
 
-            const expected = 320 * 1000 / 8;
-            const ratio = bytes.length / expected;
+            const ratio = mp3Entry ? mp3Entry.data.length / (320 * 1000 / 8) : 0;
 
-            check(`时长约 1 秒（实际 ${(ratio).toFixed(2)} 秒等效）`, ratio > 0.9 && ratio < 1.2, `字节数 ${bytes.length}`);
+            check(`MP3 时长约 0.5 秒（实际 ${ratio.toFixed(2)} 秒等效）`, ratio > 0.4 && ratio < 0.7, `字节数 ${mp3Entry?.data.length}`);
         }
 
         // --- 3. ZIP 模式：包内 WAV 转码 ---
@@ -549,22 +627,22 @@ async function main() {
             JSON.stringify(collisionResult.names)
         );
 
-        // --- 8. 转码出来的 MP3 也要能写入封面 ---
+        // --- 8. 转码出来的 MP3 也要能写入封面（封面选的是包内图片）---
         console.log('\n[8] 转码后的 MP3 写入 ID3v2 封面');
 
-        fs.readdirSync(downloadDir).forEach(name => fs.rmSync(path.join(downloadDir, name), { force: true }));
-
-        await evaluate(pageCdp, `(async () => {
+        const coverResult = await evaluate(pageCdp, `(async () => {
             ${MAKE_WAV_SOURCE}
 
-            document.getElementById('tab-audio').click();
-
-            const transfer = new DataTransfer();
-            transfer.items.add(new File([makeTestWav({ frames: 22050 })], '带封面.wav', { type: 'audio/wav' }));
-
-            const input = document.getElementById('file-input-audio');
-            input.files = transfer.files;
-            input.dispatchEvent(new Event('change', { bubbles: true }));
+            const indexOfBytes = (haystack, needle) => {
+                outer: for (let i = 0; i + needle.length <= haystack.length; i++) {
+                    for (let j = 0; j < needle.length; j++) {
+                        if (haystack[i + j] !== needle[j]) continue outer;
+                    }
+                    return i;
+                }
+                return -1;
+            };
+            const ascii = text => Array.from(text).map(char => char.charCodeAt(0));
 
             // 造一张真 JPEG 当封面
             const canvas = document.createElement('canvas');
@@ -574,48 +652,49 @@ async function main() {
             ctx.fillStyle = '#ff0000';
             ctx.fillRect(0, 0, 400, 400);
 
-            const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
-            const coverInput = document.getElementById('file-input-cover');
-            const coverTransfer = new DataTransfer();
+            const jpegBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+            const jpegBytes = new Uint8Array(await jpegBlob.arrayBuffer());
 
-            coverTransfer.items.add(new File([blob], '封面.jpg', { type: 'image/jpeg' }));
-            coverInput.files = coverTransfer.files;
-            coverInput.dispatchEvent(new Event('change', { bubbles: true }));
+            const source = new JSZip();
+            source.file('包/曲目.wav', makeTestWav({ frames: 22050 }));
+            source.file('包/封面.jpg', jpegBytes);
 
-            await new Promise(resolve => setTimeout(resolve, 300));
-            document.getElementById('convert-btn').click();
+            const blob = await source.generateAsync({ type: 'blob' });
 
-            return true;
+            switchTab('zip');
+            document.getElementById('transcode-wav-checkbox').checked = true;
+            await handleZipFile(new File([blob], '带封面.zip', { type: 'application/zip' }));
+
+            // 点第一张封面缩略图选中封面
+            const wrapper = document.querySelector('#image-preview-grid .image-thumb-wrapper');
+            if (wrapper) wrapper.click();
+
+            const coverSelected = !!selectedCoverImage;
+
+            const output = new JSZip();
+            await processZipMode(output);
+
+            const mp3Name = Object.keys(output.files).find(name => name.endsWith('.mp3'));
+            const bytes = mp3Name ? await output.file(mp3Name).async('uint8array') : new Uint8Array(0);
+
+            return {
+                coverSelected,
+                mp3Name,
+                hasId3: bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33,
+                hasApic: indexOfBytes(bytes, ascii('APIC')) >= 0,
+                hasTit2: indexOfBytes(bytes, ascii('TIT2')) >= 0,
+                jpegIndex: indexOfBytes(bytes, [0xff, 0xd8, 0xff]),
+                totalLength: bytes.length
+            };
         })()`);
 
-        let coverFile = null;
-
-        for (let attempt = 0; attempt < 150; attempt++) {
-            const entries = fs.readdirSync(downloadDir).filter(name => !name.endsWith('.crdownload'));
-
-            if (entries.length) {
-                coverFile = path.join(downloadDir, entries[0]);
-                break;
-            }
-
-            await sleep(200);
-        }
-
-        check('带封面的 MP3 下载成功', !!coverFile, '没有等到下载文件');
-
-        if (coverFile) {
-            const bytes = fs.readFileSync(coverFile);
-            const hasId3 = bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33;
-            const hasApic = bytes.includes(Buffer.from('APIC'));
-            const hasTit2 = bytes.includes(Buffer.from('TIT2'));
-            const jpegIndex = bytes.indexOf(Buffer.from([0xff, 0xd8, 0xff]));
-
-            check('文件以 ID3v2 标签开头', hasId3, `首字节 ${bytes.slice(0, 4).toString('hex')}`);
-            check('包含 APIC 封面帧', hasApic);
-            check('包含 TIT2 标题帧', hasTit2);
-            check('封面是 JPEG 数据', jpegIndex > 0 && jpegIndex < 200000, `JPEG 起始位置 ${jpegIndex}`);
-            check('ID3 标签长度合理', bytes.length > 20000, `总长度 ${bytes.length}`);
-        }
+        check('包内图片可以被选为封面', coverResult.coverSelected === true);
+        check('生成了 MP3', !!coverResult.mp3Name, String(coverResult.mp3Name));
+        check('MP3 以 ID3v2 标签开头', coverResult.hasId3 === true, `标签起始=${coverResult.hasId3}`);
+        check('包含 APIC 封面帧', coverResult.hasApic === true);
+        check('包含 TIT2 标题帧', coverResult.hasTit2 === true);
+        check('封面是 JPEG 数据', coverResult.jpegIndex > 0 && coverResult.jpegIndex < 200000, `JPEG 起始位置 ${coverResult.jpegIndex}`);
+        check('ID3 标签长度合理', coverResult.totalLength > 20000, `总长度 ${coverResult.totalLength}`);
 
         // --- 9. Windows 压缩包的反斜杠条目名 ---
         // 资源管理器 / Compress-Archive 打出来的 zip，条目名是 "作品集\第一話\01.wav"，
@@ -664,51 +743,10 @@ async function main() {
         );
         check('反斜杠包转出来的 MP3 帧头正确', backslashResult.header && backslashResult.header.bitrate === 320, JSON.stringify(backslashResult.header));
 
-        // --- 10. 在「WAV 转 MP3」标签页直接丢压缩包 ---
-        console.log('\n[10] 在 WAV 标签页直接上传音声压缩包');
-
-        const audioZipResult = await evaluate(pageCdp, `(async () => {
-            ${MAKE_WAV_SOURCE}
-
-            const source = new JSZip();
-            source.file('音声包/曲目.wav', makeTestWav({ frames: 11025 }));
-            source.file('音声包/曲目.wav.vtt', 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n台词\\n');
-
-            const blob = await source.generateAsync({ type: 'blob' });
-
-            document.getElementById('tab-audio').click();
-
-            const transfer = new DataTransfer();
-            transfer.items.add(new File([blob], '音声包.zip', { type: 'application/zip' }));
-
-            const input = document.getElementById('file-input-audio');
-            input.files = transfer.files;
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-
-            for (let i = 0; i < 60 && !loadedZip; i++) {
-                await new Promise(resolve => setTimeout(resolve, 100));
-            }
-
-            return {
-                currentTab,
-                zipTabActive: document.getElementById('tab-zip').classList.contains('active'),
-                transcodeChecked: document.getElementById('transcode-wav-checkbox').checked,
-                zipLoaded: !!loadedZip,
-                listText: document.getElementById('file-list').textContent,
-                buttonText: document.getElementById('btn-text').textContent
-            };
-        })()`);
-
-        check('自动切到 ZIP 标签页', audioZipResult.zipTabActive === true && audioZipResult.currentTab === 'zip', `currentTab=${audioZipResult.currentTab}`);
-        check('压缩包已解析', audioZipResult.zipLoaded === true);
-        check('自动勾选 WAV 转码', audioZipResult.transcodeChecked === true);
-        check('列表提示会转码 WAV', audioZipResult.listText.includes('WAV 文件将转码'), audioZipResult.listText);
-        check('按钮文案回到「转换并下载 ZIP」', audioZipResult.buttonText === '转换并下载 ZIP', audioZipResult.buttonText);
-
-        // --- 11. 窄屏下三个标签都要能被真实鼠标点到 ---
+        // --- 10. 窄屏下标签都要能被真实鼠标点到 ---
         // 只点 element.click() 会掩盖"被 overflow-hidden 裁掉"这类问题，
         // 所以这里缩到 320px 宽并用 CDP 派发真实鼠标事件。
-        console.log('\n[11] 窄屏 320px 下用真实鼠标点击标签页');
+        console.log('\n[10] 窄屏 320px 下用真实鼠标点击标签页');
 
         await pageCdp.send('Emulation.setDeviceMetricsOverride', {
             width: 320,
@@ -723,7 +761,7 @@ async function main() {
         await reloadedForNarrow;
         await waitForDeps(100);
 
-        for (const [tabId, expectedTab] of [['tab-direct', 'direct'], ['tab-zip', 'zip'], ['tab-audio', 'audio']]) {
+        for (const [tabId, expectedTab] of [['tab-direct', 'direct'], ['tab-zip', 'zip']]) {
             const hit = await evaluate(pageCdp, `(() => {
                 const tab = document.getElementById('${tabId}');
                 const rect = tab.getBoundingClientRect();
@@ -754,8 +792,8 @@ async function main() {
         }
 
         check(
-            '切到 WAV 标签后音频面板真的显示出来',
-            await evaluate(pageCdp, 'document.getElementById("panel-audio").classList.contains("active")')
+            '切到 ZIP 标签后 ZIP 选项区真的显示出来',
+            await evaluate(pageCdp, '!document.getElementById("zip-options").classList.contains("hidden")')
         );
     } finally {
         pageCdp?.close();

@@ -3,7 +3,7 @@ body {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
 }
-#file-input-direct, #file-input-zip, #file-input-audio, #file-input-cover { display: none; }
+#file-input-direct, #file-input-zip { display: none; }
 .drop-zone.dragover {
     transform: scale(1.02);
     box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.4);

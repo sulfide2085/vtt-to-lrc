@@ -1,16 +1,11 @@
 // DOM 元素
 const tabDirect = document.getElementById('tab-direct');
 const tabZip = document.getElementById('tab-zip');
-const tabAudio = document.getElementById('tab-audio');
 const panelDirect = document.getElementById('panel-direct');
 const panelZip = document.getElementById('panel-zip');
-const panelAudio = document.getElementById('panel-audio');
 const dropZones = document.querySelectorAll('.drop-zone');
 const fileInputDirect = document.getElementById('file-input-direct');
 const fileInputZip = document.getElementById('file-input-zip');
-const fileInputAudio = document.getElementById('file-input-audio');
-const fileInputCover = document.getElementById('file-input-cover');
-const coverFileName = document.getElementById('cover-file-name');
 const fileListContainer = document.getElementById('file-list-container');
 const fileListTitle = document.getElementById('file-list-title');
 const fileList = document.getElementById('file-list');
@@ -20,12 +15,10 @@ const clearBtn = document.getElementById('clear-btn');
 const btnText = document.getElementById('btn-text');
 const spinner = document.getElementById('spinner');
 const statusMessage = document.getElementById('status-message');
-const flattenOption = document.getElementById('flatten-option');
+const zipOptions = document.getElementById('zip-options');
 const flattenCheckbox = document.getElementById('flatten-checkbox');
 const imagePreviewContainer = document.getElementById('image-preview-container');
 const imagePreviewGrid = document.getElementById('image-preview-grid');
-const audioOptions = document.getElementById('audio-options');
-const transcodeOption = document.getElementById('transcode-option');
 const transcodeWavCheckbox = document.getElementById('transcode-wav-checkbox');
 const lameStatus = document.getElementById('lame-status');
 const progressContainer = document.getElementById('progress-container');
@@ -34,13 +27,11 @@ const progressText = document.getElementById('progress-text');
 
 // 状态
 let filesToProcess = []; // 统一存储待处理文件 { name, getContent }
-let audioFilesToProcess = []; // 待转码的 WAV File 对象
-let audioFileStatusNodes = []; // 文件列表里每行的状态节点
 let loadedZip = null; // 存储上传的 ZIP 对象
 let originalInputName = null; // 存储原始输入文件名
 let zipImages = []; // { name, mime, base64 }
 let selectedCoverImage = null; // { mime, base64 } 或 null
-let currentTab = 'direct'; // direct | zip | audio
+let currentTab = 'direct'; // direct | zip
 let zipHasMp3 = false; // 包内是否有 MP3（用于文件列表提示）
 let zipWavCount = 0; // 包内 WAV 数量
 
@@ -51,15 +42,13 @@ const MP3_BITRATE = 320;
 
 const TAB_ELEMENTS = {
     direct: { tab: tabDirect, panel: panelDirect },
-    zip: { tab: tabZip, panel: panelZip },
-    audio: { tab: tabAudio, panel: panelAudio }
+    zip: { tab: tabZip, panel: panelZip }
 };
 
 // --- 事件监听 ---
 
 tabDirect.addEventListener('click', () => switchTab('direct'));
 tabZip.addEventListener('click', () => switchTab('zip'));
-tabAudio.addEventListener('click', () => switchTab('audio'));
 
 dropZones.forEach(zone => {
     zone.addEventListener('dragover', e => {
@@ -78,9 +67,7 @@ dropZones.forEach(zone => {
         const files = e.dataTransfer.files;
         const panel = zone.closest('.tab-content');
 
-        if (panel && panel.id === 'panel-audio') {
-            handleAudioFiles(files);
-        } else if (panel && panel.id === 'panel-zip') {
+        if (panel && panel.id === 'panel-zip') {
             if (files.length) handleZipFile(files[0]);
         } else {
             handleDirectFiles(files);
@@ -94,14 +81,6 @@ fileInputDirect.addEventListener('change', e => {
 
 fileInputZip.addEventListener('change', e => {
     if (e.target.files.length) handleZipFile(e.target.files[0]);
-});
-
-fileInputAudio.addEventListener('change', e => {
-    handleAudioFiles(e.target.files);
-});
-
-fileInputCover.addEventListener('change', e => {
-    if (e.target.files.length) handleCoverFile(e.target.files[0]);
 });
 
 transcodeWavCheckbox.addEventListener('change', refreshZipFileList);
@@ -258,27 +237,13 @@ function switchTab(tabName) {
         elements.panel.classList.toggle('active', isActive);
     });
 
-    flattenOption.classList.toggle('hidden', tabName !== 'zip');
-    audioOptions.classList.toggle('hidden', tabName === 'direct');
-    transcodeOption.classList.toggle('hidden', tabName !== 'zip');
+    zipOptions.classList.toggle('hidden', tabName !== 'zip');
 
     clearFiles();
-    updateActionButtonText();
-}
-
-function updateActionButtonText() {
-    if (currentTab === 'audio') {
-        btnText.textContent = audioFilesToProcess.length > 1 ? '转码并下载 ZIP' : '转码并下载 MP3';
-        return;
-    }
-
-    btnText.textContent = '转换并下载 ZIP';
 }
 
 function clearFiles() {
     filesToProcess = [];
-    audioFilesToProcess = [];
-    audioFileStatusNodes = [];
     loadedZip = null;
     originalInputName = null;
     zipImages = [];
@@ -291,9 +256,6 @@ function clearFiles() {
 
     fileInputDirect.value = '';
     fileInputZip.value = '';
-    fileInputAudio.value = '';
-    fileInputCover.value = '';
-    coverFileName.textContent = '';
 
     fileList.innerHTML = '';
     fileListTitle.textContent = '待处理 VTT 文件';
@@ -303,7 +265,6 @@ function clearFiles() {
     hideProgress();
     showStatusMessage('');
     setButtonLoading(false);
-    updateActionButtonText();
 }
 
 function setButtonLoading(isLoading) {
@@ -392,118 +353,7 @@ async function handleZipFile(zipFile) {
     }
 }
 
-// --- WAV 文件处理（音频转码模式）---
-
-function handleAudioFiles(inputFileList) {
-    // 先选封面、再选音频时，封面不应该被清掉
-    const previousImages = zipImages;
-    const previousCover = selectedCoverImage;
-
-    // 同样先快照：clearFiles() 会把 input.value 置空，FileList 会跟着变空
-    const selectedFiles = Array.from(inputFileList);
-
-    // 直接丢进来一个音声压缩包：转到 ZIP 流程，并默认勾选 WAV 转码
-    const zipFile = selectedFiles.find(file => isZipFile(file));
-
-    if (zipFile) {
-        transcodeWavCheckbox.checked = true;
-        switchTab('zip');
-        handleZipFile(zipFile);
-        return;
-    }
-
-    clearFiles();
-
-    const wavFiles = selectedFiles.filter(file => isWavFile(file.name));
-
-    if (wavFiles.length === 0) {
-        showStatusMessage('请选择 .wav 文件。');
-        return;
-    }
-
-    originalInputName = wavFiles[0].name;
-    audioFilesToProcess = wavFiles;
-
-    if (previousCover) {
-        zipImages = previousImages;
-        selectedCoverImage = previousCover;
-        coverFileName.textContent = previousCover.name || '';
-        renderImageGrid();
-    }
-
-    renderAudioFileList();
-    updateActionButtonText();
-    showStatusMessage('');
-}
-
-async function handleCoverFile(file) {
-    if (!file.type.startsWith('image/')) {
-        showStatusMessage('封面必须是图片文件。');
-        return;
-    }
-
-    try {
-        const base64 = await blobToBase64(file);
-        const image = {
-            name: file.name,
-            mime: file.type || 'image/jpeg',
-            base64
-        };
-
-        zipImages = [image];
-        selectedCoverImage = {
-            name: image.name,
-            mime: image.mime,
-            base64: image.base64
-        };
-        coverFileName.textContent = file.name;
-
-        renderImageGrid();
-        showStatusMessage('');
-    } catch (error) {
-        console.error('读取封面图片失败:', error);
-        showStatusMessage('读取封面图片失败。');
-    }
-}
-
-function renderAudioFileList() {
-    fileList.innerHTML = '';
-    audioFileStatusNodes = [];
-
-    audioFilesToProcess.forEach(file => {
-        const li = document.createElement('li');
-        li.className = 'list-item flex items-center justify-between bg-gray-50 p-3 rounded-lg';
-
-        const safeName = escapeHtml(file.name);
-
-        li.innerHTML = `
-            <span class="text-sm font-medium text-gray-700 truncate" title="${safeName}">${safeName}</span>
-            <span class="text-sm text-gray-400 shrink-0 ml-2" data-role="status">${WavToMp3.formatBytes(file.size)}</span>
-        `;
-
-        fileList.appendChild(li);
-        audioFileStatusNodes.push(li.querySelector('[data-role="status"]'));
-    });
-
-    fileListTitle.textContent = '待转码 WAV 文件';
-    fileListContainer.classList.remove('hidden');
-    actionButtons.classList.remove('hidden');
-}
-
-function setAudioFileStatus(index, text, tone = 'muted') {
-    const node = audioFileStatusNodes[index];
-
-    if (!node) return;
-
-    const colors = {
-        muted: 'text-gray-400',
-        done: 'text-green-600',
-        error: 'text-red-500'
-    };
-
-    node.textContent = text;
-    node.className = `text-sm shrink-0 ml-2 ${colors[tone] || colors.muted}`;
-}
+// --- 文件列表 ---
 
 function updateFileListUI(hasMp3 = false, wavCount = 0) {
     zipHasMp3 = hasMp3;
@@ -1227,13 +1077,6 @@ function addNumberSuffixUntilUnique(filename, existingNames) {
 // --- 转换与下载 ---
 
 async function convertAndDownload() {
-    if (currentTab === 'audio') {
-        if (audioFilesToProcess.length === 0) return;
-
-        await convertAudioFiles();
-        return;
-    }
-
     if (filesToProcess.length === 0 && !loadedZip) return;
 
     setButtonLoading(true);
@@ -1266,133 +1109,6 @@ async function convertAndDownload() {
         setButtonLoading(false);
         hideProgress();
     }
-}
-
-// --- WAV 转 MP3 ---
-
-async function convertAudioFiles() {
-    setButtonLoading(true);
-    showStatusMessage('');
-    setProgress(0, '准备转码…');
-
-    const startedAt = Date.now();
-
-    try {
-        const result = await processAudioMode();
-        const outputs = result.outputs;
-        const failures = result.failures;
-        const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
-
-        if (outputs.length === 0) {
-            throw new Error(failures.join('；') || '没有可用的输出。');
-        }
-
-        if (outputs.length === 1) {
-            downloadBlob(new Blob([outputs[0].buffer], {
-                type: 'audio/mpeg'
-            }), outputs[0].name);
-        } else {
-            const outputZip = new JSZip();
-            const usedNames = new Set();
-
-            outputs.forEach(output => {
-                const name = usedNames.has(output.name)
-                    ? addNumberSuffixUntilUnique(output.name, usedNames)
-                    : output.name;
-
-                usedNames.add(name);
-                outputZip.file(name, new Blob([output.buffer], {
-                    type: 'audio/mpeg'
-                }));
-            });
-
-            const zipBlob = await outputZip.generateAsync({
-                type: 'blob'
-            });
-
-            downloadBlob(zipBlob, getAudioDownloadName(outputs.length));
-        }
-
-        if (failures.length > 0) {
-            showStatusMessage(`完成 ${outputs.length} 个，失败 ${failures.length} 个：${failures.join('；')}`);
-        } else {
-            setProgress(1, `全部完成，用时 ${elapsed} 秒`);
-            showStatusMessage('');
-        }
-    } catch (error) {
-        console.error('WAV 转 MP3 失败:', error);
-        showStatusMessage(`转码失败：${error.message || '请在控制台查看错误信息。'}`);
-        hideProgress();
-    } finally {
-        setButtonLoading(false);
-    }
-}
-
-async function processAudioMode() {
-    const bitrate = MP3_BITRATE;
-    const total = audioFilesToProcess.length;
-    const outputs = [];
-    const failures = [];
-
-    for (let index = 0; index < total; index++) {
-        const file = audioFilesToProcess[index];
-        const label = total > 1 ? `(${index + 1}/${total}) ${file.name}` : file.name;
-
-        setAudioFileStatus(index, '转码中…');
-
-        try {
-            const arrayBuffer = await file.arrayBuffer();
-
-            const result = await WavToMp3.wavToMp3(arrayBuffer, {
-                bitrate,
-                onProgress: (ratio, message) => setProgress((index + ratio) / total, `${label} — ${message || ''}`)
-            });
-
-            let outputBuffer = result.data.buffer;
-
-            if (selectedCoverImage) {
-                setProgress((index + 0.98) / total, `${label} — 正在写入封面…`);
-
-                outputBuffer = await addId3v2Cover(
-                    outputBuffer,
-                    selectedCoverImage.base64,
-                    selectedCoverImage.mime,
-                    {
-                        title: file.name.replace(/\.wav$/i, '')
-                    }
-                );
-            }
-
-            outputs.push({
-                name: toMp3Filename(file.name),
-                buffer: outputBuffer,
-                result
-            });
-
-            const limitedNote = result.bitrateLimited
-                ? `（源采样率 ${result.sampleRate} Hz，上限 ${result.bitrate} kbps）`
-                : '';
-
-            setAudioFileStatus(
-                index,
-                `完成 · ${result.bitrate} kbps · ${WavToMp3.formatBytes(outputBuffer.byteLength)}${limitedNote}`,
-                'done'
-            );
-        } catch (error) {
-            // 单个文件坏掉不应该影响整批
-            console.error(`转码失败：${file.name}`, error);
-            failures.push(`${file.name}：${error.message}`);
-            setAudioFileStatus(index, `失败：${error.message}`, 'error');
-        }
-    }
-
-    return { outputs, failures };
-}
-
-function getAudioDownloadName(count) {
-    const baseName = originalInputName ? originalInputName.replace(/\.wav$/i, '') : 'audio';
-
-    return `${baseName}等${count}个_mp3.zip`;
 }
 
 // --- ZIP 模式内的 WAV 转码 ---
