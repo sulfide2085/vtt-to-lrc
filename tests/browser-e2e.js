@@ -383,6 +383,14 @@ async function main() {
         check('lamejs / audio.js / JSZip 均已就绪', ready === true, '依赖未加载完成');
         check('只剩两个标签页（WAV 单页已移除）', await evaluate(pageCdp, `document.querySelectorAll('.tab-btn').length === 2 && document.getElementById('tab-audio') === null && document.getElementById('panel-audio') === null`));
         check('界面不再提供码率选择', await evaluate(pageCdp, 'document.getElementById("mp3-bitrate") === null'));
+        check('页脚有 GitHub 仓库链接', await evaluate(pageCdp, `(() => {
+            const link = document.querySelector('footer a[href*="github.com"]');
+
+            return !!link &&
+                link.getAttribute('href') === 'https://github.com/sulfide2085/vtt-to-lrc' &&
+                link.getAttribute('target') === '_blank' &&
+                link.textContent.includes('vtt-to-lrc');
+        })()`));
 
         // --- 2. ZIP 模式：真实点击 + 真实下载，并把下载到的压缩包拆开检查 ---
         console.log('\n[2] ZIP 模式（真实点击 + 真实下载，解包校验内容）');
