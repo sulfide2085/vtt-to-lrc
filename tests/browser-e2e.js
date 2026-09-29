@@ -616,6 +616,59 @@ async function main() {
             check('封面是 JPEG 数据', jpegIndex > 0 && jpegIndex < 200000, `JPEG 起始位置 ${jpegIndex}`);
             check('ID3 标签长度合理', bytes.length > 20000, `总长度 ${bytes.length}`);
         }
+
+        // --- 9. 窄屏下三个标签都要能被真实鼠标点到 ---
+        // 只点 element.click() 会掩盖"被 overflow-hidden 裁掉"这类问题，
+        // 所以这里缩到 320px 宽并用 CDP 派发真实鼠标事件。
+        console.log('\n[9] 窄屏 320px 下用真实鼠标点击标签页');
+
+        await pageCdp.send('Emulation.setDeviceMetricsOverride', {
+            width: 320,
+            height: 800,
+            deviceScaleFactor: 2,
+            mobile: true
+        });
+
+        const reloadedForNarrow = pageCdp.once('Page.loadEventFired');
+
+        await pageCdp.send('Page.reload', { ignoreCache: true });
+        await reloadedForNarrow;
+        await waitForDeps(100);
+
+        for (const [tabId, expectedTab] of [['tab-direct', 'direct'], ['tab-zip', 'zip'], ['tab-audio', 'audio']]) {
+            const hit = await evaluate(pageCdp, `(() => {
+                const tab = document.getElementById('${tabId}');
+                const rect = tab.getBoundingClientRect();
+                const nav = tab.parentElement;
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+
+                return {
+                    x: cx,
+                    y: cy,
+                    visible: rect.width > 0 && rect.left >= 0 && rect.right <= window.innerWidth,
+                    hitTarget: document.elementFromPoint(cx, cy) === tab,
+                    navOverflow: nav.scrollWidth > nav.clientWidth
+                };
+            })()`);
+
+            await pageCdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: hit.x, y: hit.y, button: 'left', clickCount: 1 });
+            await pageCdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: hit.x, y: hit.y, button: 'left', clickCount: 1 });
+            await sleep(200);
+
+            const state = await evaluate(pageCdp, 'currentTab');
+
+            check(
+                `${tabId} 在 320px 下可见、不被遮挡、点击后切到 ${expectedTab}`,
+                hit.visible && hit.hitTarget && !hit.navOverflow && state === expectedTab,
+                `可见=${hit.visible} 命中=${hit.hitTarget} 标签栏溢出=${hit.navOverflow} currentTab=${state}`
+            );
+        }
+
+        check(
+            '切到 WAV 标签后音频面板真的显示出来',
+            await evaluate(pageCdp, 'document.getElementById("panel-audio").classList.contains("active")')
+        );
     } finally {
         pageCdp?.close();
         browserCdp?.close();

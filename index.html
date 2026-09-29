@@ -24,14 +24,15 @@
             <main>
                 <!-- 标签页 -->
                 <div class="border-b border-gray-200 mb-6">
-                    <nav class="-mb-px flex space-x-4 sm:space-x-6" aria-label="Tabs">
-                        <button id="tab-direct" class="tab-btn active whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">
+                    <!-- flex-wrap：窄屏（手机）放不下时换行，否则第三个标签会被卡片的 overflow-hidden 裁掉而点不到 -->
+                    <nav class="-mb-px flex flex-wrap gap-x-4 gap-y-1 sm:gap-x-6" aria-label="Tabs">
+                        <button type="button" id="tab-direct" class="tab-btn active whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">
                             上传多个 VTT 文件
                         </button>
-                        <button id="tab-zip" class="tab-btn whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm text-gray-500 hover:text-gray-700">
+                        <button type="button" id="tab-zip" class="tab-btn whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm text-gray-500 hover:text-gray-700">
                             上传 ZIP 压缩包
                         </button>
-                        <button id="tab-audio" class="tab-btn whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm text-gray-500 hover:text-gray-700">
+                        <button type="button" id="tab-audio" class="tab-btn whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm text-gray-500 hover:text-gray-700">
                             WAV 转 MP3
                         </button>
                     </nav>
