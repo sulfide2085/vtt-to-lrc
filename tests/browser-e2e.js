@@ -2,6 +2,7 @@
  * 浏览器端到端测试：用真实 Chrome 驱动真实页面
  *
  *   node tests/browser-e2e.js
+ *   node tests/browser-e2e.js https://sulfide2085.github.io/vtt-to-lrc/   # 直接测线上站点
  *
  * 覆盖：
  *   1. 页面加载后 WavToMp3 / lamejs / JSZip 是否就绪
@@ -18,7 +19,8 @@ const os = require('os');
 const path = require('path');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
-const PAGE_URL = `file:///${path.join(PROJECT_ROOT, 'index.html').replace(/\\/g, '/')}`;
+const LOCAL_URL = `file:///${path.join(PROJECT_ROOT, 'index.html').replace(/\\/g, '/')}`;
+const TARGET_URL = process.argv[2] || LOCAL_URL;
 
 const CHROME_CANDIDATES = [
     process.env.CHROME_PATH,
@@ -277,7 +279,7 @@ async function main() {
 
         const loaded = pageCdp.once('Page.loadEventFired');
 
-        await pageCdp.send('Page.navigate', { url: PAGE_URL });
+        await pageCdp.send('Page.navigate', { url: TARGET_URL });
         await loaded;
 
         // 等 CDN 脚本（Tailwind / JSZip / lamejs）就绪；CDN 偶发抖动时重载一次

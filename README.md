@@ -53,6 +53,9 @@ tests/browser-e2e.js     — 真实浏览器端到端测试（需要本机 Chrom
 ```bash
 node tests/wav-to-mp3.test.js   # 19 项：解析、位深、重采样、码率收敛、MP3 帧头
 node tests/browser-e2e.js       # 41 项：真实 Chrome 驱动页面，含真实下载与 ID3 封面校验
+
+# 也可以直接测线上站点（部署后冒烟验证）
+node tests/browser-e2e.js https://sulfide2085.github.io/vtt-to-lrc/
 ```
 
 两个脚本都不需要安装依赖：单元测试会在首次运行时把 lamejs 缓存到系统临时目录；端到端测试找不到 Chrome/Edge 时会自动跳过。
