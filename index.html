@@ -53,7 +53,7 @@
                         <label for="file-input-zip" class="drop-zone cursor-pointer flex flex-col items-center justify-center border-2 border-dashed border-gray-300 rounded-2xl p-12 text-center transition-all duration-300 ease-in-out hover:border-blue-500 hover:bg-blue-50">
                             <svg class="w-16 h-16 text-gray-400 mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 8.25H7.5a2.25 2.25 0 00-2.25 2.25v9a2.25 2.25 0 002.25 2.25h9A2.25 2.25 0 0018.75 19.5V10.5A2.25 2.25 0 0016.5 8.25H15M12 12.75V3m0 0l-3.75 3.75M12 3l3.75 3.75" /></svg>
                             <span class="font-semibold text-gray-600">点击选择或拖拽 ZIP 压缩包</span>
-                            <p class="text-sm text-gray-500 mt-1">将转换包内 VTT 文件并保留其他文件 (如 MP3)</p>
+                            <p class="text-sm text-gray-500 mt-1">包内 VTT 转 LRC；勾选下方选项后包内 WAV 会转码为 MP3</p>
                             <input id="file-input-zip" type="file" accept=".zip,application/zip,application/x-zip-compressed">
                         </label>
                     </div>
@@ -62,8 +62,9 @@
                         <label for="file-input-audio" class="drop-zone cursor-pointer flex flex-col items-center justify-center border-2 border-dashed border-gray-300 rounded-2xl p-12 text-center transition-all duration-300 ease-in-out hover:border-blue-500 hover:bg-blue-50">
                             <svg class="w-16 h-16 text-gray-400 mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 9l10.5-3m0 6.553v3.75a2.25 2.25 0 01-1.632 2.163l-1.32.377a1.803 1.803 0 11-.99-3.467l2.31-.66a2.25 2.25 0 001.632-2.163zm0 0V2.25L9 5.25v10.303m0 0v3.75a2.25 2.25 0 01-1.632 2.163l-1.32.377a1.803 1.803 0 01-.99-3.467l2.31-.66A2.25 2.25 0 009 15.553z" /></svg>
                             <span class="font-semibold text-gray-600">点击选择或拖拽多个 .wav 文件</span>
-                            <p class="text-sm text-gray-500 mt-1">转码为最高 320 kbps 的 MP3，方便和 LRC 歌词一起放进播放器</p>
-                            <input id="file-input-audio" type="file" multiple accept=".wav,audio/wav,audio/x-wav,audio/wave">
+                            <p class="text-sm text-gray-500 mt-1">转码为 320 kbps 的 MP3，方便和 LRC 歌词一起放进播放器</p>
+                            <p class="text-sm text-gray-500 mt-1">也可以直接丢进 .zip 音声压缩包，会自动转成「MP3 + LRC」的压缩包</p>
+                            <input id="file-input-audio" type="file" multiple accept=".wav,.zip,audio/wav,audio/x-wav,audio/wave,application/zip,application/x-zip-compressed">
                         </label>
                         <div class="mt-4 flex items-center gap-3 flex-wrap">
                             <label for="file-input-cover" class="cursor-pointer text-sm font-medium text-blue-600 hover:text-blue-700 border border-blue-200 bg-blue-50 rounded-lg px-3 py-1.5">

@@ -617,10 +617,98 @@ async function main() {
             check('ID3 标签长度合理', bytes.length > 20000, `总长度 ${bytes.length}`);
         }
 
-        // --- 9. 窄屏下三个标签都要能被真实鼠标点到 ---
+        // --- 9. Windows 压缩包的反斜杠条目名 ---
+        // 资源管理器 / Compress-Archive 打出来的 zip，条目名是 "作品集\第一話\01.wav"，
+        // 反斜杠在 zip 规范里不是分隔符，不修正会输出带反斜杠的怪文件名。
+        console.log('\n[9] Windows 反斜杠条目名的压缩包');
+
+        const backslashResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+            ${READ_MP3_HEADER_SOURCE}
+
+            const source = new JSZip();
+            source.file('作品集\\\\第一話\\\\01.wav', makeTestWav({ frames: 11025 }));
+            source.file('作品集\\\\第一話\\\\01.wav.vtt', 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n第一句\\n');
+            source.file('作品集\\\\第二話\\\\02.wav', makeTestWav({ frames: 11025, freq: 660 }));
+            source.file('作品集\\\\第二話\\\\02.wav.vtt', 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n第二句\\n');
+
+            const blob = await source.generateAsync({ type: 'blob' });
+
+            switchTab('zip');
+            document.getElementById('transcode-wav-checkbox').checked = true;
+            await handleZipFile(new File([blob], '反斜杠包.zip', { type: 'application/zip' }));
+
+            const output = new JSZip();
+            await processZipMode(output);
+
+            const names = Object.keys(output.files).filter(name => !output.files[name].dir).sort();
+            const mp3Bytes = names.filter(n => n.endsWith('.mp3')).length
+                ? await output.file(names.find(n => n.endsWith('.mp3'))).async('uint8array')
+                : null;
+
+            return {
+                names,
+                anyBackslash: names.some(name => name.includes('\\\\')),
+                header: mp3Bytes ? readMp3Header(mp3Bytes) : null,
+                lrcStems: names.filter(n => n.endsWith('.lrc')).map(n => n.replace(/\\.lrc$/, '')),
+                mp3Stems: names.filter(n => n.endsWith('.mp3')).map(n => n.replace(/\\.mp3$/, ''))
+            };
+        })()`);
+
+        check('输出文件名里没有反斜杠', backslashResult.anyBackslash === false, JSON.stringify(backslashResult.names));
+        check('生成了 2 个 MP3', backslashResult.mp3Stems.length === 2, JSON.stringify(backslashResult.names));
+        check(
+            'LRC 与 MP3 依然同名配对',
+            backslashResult.lrcStems.length === 2 && backslashResult.lrcStems.every(stem => backslashResult.mp3Stems.includes(stem)),
+            `LRC=${JSON.stringify(backslashResult.lrcStems)} MP3=${JSON.stringify(backslashResult.mp3Stems)}`
+        );
+        check('反斜杠包转出来的 MP3 帧头正确', backslashResult.header && backslashResult.header.bitrate === 320, JSON.stringify(backslashResult.header));
+
+        // --- 10. 在「WAV 转 MP3」标签页直接丢压缩包 ---
+        console.log('\n[10] 在 WAV 标签页直接上传音声压缩包');
+
+        const audioZipResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+
+            const source = new JSZip();
+            source.file('音声包/曲目.wav', makeTestWav({ frames: 11025 }));
+            source.file('音声包/曲目.wav.vtt', 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n台词\\n');
+
+            const blob = await source.generateAsync({ type: 'blob' });
+
+            document.getElementById('tab-audio').click();
+
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([blob], '音声包.zip', { type: 'application/zip' }));
+
+            const input = document.getElementById('file-input-audio');
+            input.files = transfer.files;
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+
+            for (let i = 0; i < 60 && !loadedZip; i++) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+
+            return {
+                currentTab,
+                zipTabActive: document.getElementById('tab-zip').classList.contains('active'),
+                transcodeChecked: document.getElementById('transcode-wav-checkbox').checked,
+                zipLoaded: !!loadedZip,
+                listText: document.getElementById('file-list').textContent,
+                buttonText: document.getElementById('btn-text').textContent
+            };
+        })()`);
+
+        check('自动切到 ZIP 标签页', audioZipResult.zipTabActive === true && audioZipResult.currentTab === 'zip', `currentTab=${audioZipResult.currentTab}`);
+        check('压缩包已解析', audioZipResult.zipLoaded === true);
+        check('自动勾选 WAV 转码', audioZipResult.transcodeChecked === true);
+        check('列表提示会转码 WAV', audioZipResult.listText.includes('WAV 文件将转码'), audioZipResult.listText);
+        check('按钮文案回到「转换并下载 ZIP」', audioZipResult.buttonText === '转换并下载 ZIP', audioZipResult.buttonText);
+
+        // --- 11. 窄屏下三个标签都要能被真实鼠标点到 ---
         // 只点 element.click() 会掩盖"被 overflow-hidden 裁掉"这类问题，
         // 所以这里缩到 320px 宽并用 CDP 派发真实鼠标事件。
-        console.log('\n[9] 窄屏 320px 下用真实鼠标点击标签页');
+        console.log('\n[11] 窄屏 320px 下用真实鼠标点击标签页');
 
         await pageCdp.send('Emulation.setDeviceMetricsOverride', {
             width: 320,

@@ -162,6 +162,50 @@ function isZipFile(file) {
     return file.type.includes('zip') || /\.zip$/i.test(file.name);
 }
 
+/**
+ * 把 ZIP 条目名里的反斜杠统一成斜杠。
+ *
+ * Windows 资源管理器 / Compress-Archive 打包时用反斜杠存路径
+ * （音声压缩包基本都是这么来的），而反斜杠在 zip 规范里并不是分隔符，
+ * 不处理的话输出包会出现 "作品集\第一話\01.mp3" 这种带反斜杠的怪文件名，
+ * 解压时要么报错要么变成一个名字里带 \ 的文件。
+ */
+function normalizeZipEntryNames(zip) {
+    const rawNames = Object.keys(zip.files);
+    let fixedCount = 0;
+
+    rawNames.forEach(rawName => {
+        if (rawName.indexOf('\\') === -1) return;
+
+        const entry = zip.files[rawName];
+        let fixedName = rawName.replace(/\\+/g, '/').replace(/\/{2,}/g, '/');
+
+        // 极少数情况下 zip 里同时存在 a\b 和 a/b，避免互相覆盖
+        if (zip.files[fixedName] && zip.files[fixedName] !== entry) {
+            const dotIndex = fixedName.lastIndexOf('.');
+            const base = dotIndex > 0 ? fixedName.slice(0, dotIndex) : fixedName;
+            const ext = dotIndex > 0 ? fixedName.slice(dotIndex) : '';
+            let counter = 2;
+
+            while (zip.files[`${base}_${counter}${ext}`]) counter++;
+
+            fixedName = `${base}_${counter}${ext}`;
+        }
+
+        delete zip.files[rawName];
+
+        entry.name = fixedName;
+        zip.files[fixedName] = entry;
+        fixedCount++;
+    });
+
+    if (fixedCount > 0) {
+        console.info(`已修正 ${fixedCount} 个 ZIP 条目名的路径分隔符（反斜杠 → 斜杠）`);
+    }
+
+    return fixedCount;
+}
+
 // --- 进度显示 ---
 
 function setProgress(ratio, text) {
@@ -311,6 +355,7 @@ async function handleZipFile(zipFile) {
 
     try {
         loadedZip = await JSZip.loadAsync(zipFile);
+        normalizeZipEntryNames(loadedZip);
 
         const vttZipEntries = [];
         let hasMp3 = false;
@@ -356,6 +401,16 @@ function handleAudioFiles(inputFileList) {
 
     // 同样先快照：clearFiles() 会把 input.value 置空，FileList 会跟着变空
     const selectedFiles = Array.from(inputFileList);
+
+    // 直接丢进来一个音声压缩包：转到 ZIP 流程，并默认勾选 WAV 转码
+    const zipFile = selectedFiles.find(file => isZipFile(file));
+
+    if (zipFile) {
+        transcodeWavCheckbox.checked = true;
+        switchTab('zip');
+        handleZipFile(zipFile);
+        return;
+    }
 
     clearFiles();
 

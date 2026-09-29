@@ -6,7 +6,8 @@
 
 - **两种上传模式**：直接上传多个 VTT 文件，或上传 ZIP 压缩包
 - **批量转换**：一次性处理多个文件，输出为 ZIP 下载
-- **WAV 转 MP3**：独立标签页，把 WAV 转码为最高 **320 kbps CBR** 的 MP3（MPEG-1 Layer III）
+- **WAV 转 MP3**：独立标签页，把 WAV 转码为 **320 kbps CBR** 的 MP3（MPEG-1 Layer III）
+- **音声压缩包一键转码**：在「WAV 转 MP3」标签页直接丢进 `.zip` 音声压缩包，会自动转到 ZIP 流程并勾选 WAV 转码，输出「MP3 + 同名 LRC」的压缩包
 - **ZIP 内自动转码**：ZIP 模式可勾选把包内 WAV 一并转码为 MP3，体积通常缩小约 80%
 - **MP3 封面嵌入**：可从包内选择图片（或单独上传）作为封面，自动写入 MP3 的 ID3v2 标签
 - **无 VTT 也能用**：ZIP 内没有 VTT 文件时，仍可单独为 MP3 嵌入封面并下载
@@ -37,6 +38,10 @@ python -m http.server 8080
 | 已压缩音频 | ZIP 内已有的 MP3 不会被重新编码，只按需写入封面，原码率保持不变 |
 | 速度 | 约 6–10 倍实时（44.1 kHz 立体声 320 kbps 每分钟约 9 秒），转码时显示进度条 |
 
+> **关于 Windows 压缩包**：资源管理器「压缩到 zip」和 `Compress-Archive` 会用**反斜杠**记录路径
+> （`作品集\第一話\01.wav`），而反斜杠在 zip 规范里并不是分隔符。工具在读取时会自动把条目名
+> 统一成斜杠，避免输出包里出现 `作品集\第一話\01.mp3` 这种解压会出错的文件名。
+
 ## 文件结构
 
 ```
@@ -52,7 +57,7 @@ tests/browser-e2e.js     — 真实浏览器端到端测试（需要本机 Chrom
 
 ```bash
 node tests/wav-to-mp3.test.js   # 19 项：解析、位深、重采样、码率收敛、MP3 帧头
-node tests/browser-e2e.js       # 41 项：真实 Chrome 驱动页面，含真实下载与 ID3 封面校验
+node tests/browser-e2e.js       # 54 项：真实 Chrome 驱动页面，含真实下载、ID3 封面、Windows 压缩包与窄屏点击
 
 # 也可以直接测线上站点（部署后冒烟验证）
 node tests/browser-e2e.js https://sulfide2085.github.io/vtt-to-lrc/
