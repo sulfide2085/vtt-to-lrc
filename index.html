@@ -7,6 +7,10 @@
     <link rel="stylesheet" href="styles.css">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <!-- lamejs：LAME 的 JS 移植，用于把 WAV 转码成 320 kbps 的 MP3（主源失败时自动切备用源） -->
+    <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
+    <script>window.lamejs || document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js"><\/script>');</script>
+    <script>window.lamejs || document.write('<script src="https://unpkg.com/lamejs@1.2.1/lame.min.js"><\/script>');</script>
 </head>
 <body class="bg-gray-100 flex items-center justify-center min-h-screen p-4">
 
@@ -14,18 +18,21 @@
         <div class="p-8">
             <header class="text-center mb-6">
                 <h1 class="text-3xl font-bold text-gray-800">VTT to LRC 转换工具</h1>
-                <p class="text-gray-500 mt-2">批量将 VTT 字幕文件转换为 LRC 歌词文件</p>
+                <p class="text-gray-500 mt-2">批量转换 VTT 字幕为 LRC 歌词，并把 WAV 转码为高质量 MP3</p>
             </header>
 
             <main>
                 <!-- 标签页 -->
                 <div class="border-b border-gray-200 mb-6">
-                    <nav class="-mb-px flex space-x-6" aria-label="Tabs">
+                    <nav class="-mb-px flex space-x-4 sm:space-x-6" aria-label="Tabs">
                         <button id="tab-direct" class="tab-btn active whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm">
                             上传多个 VTT 文件
                         </button>
                         <button id="tab-zip" class="tab-btn whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm text-gray-500 hover:text-gray-700">
                             上传 ZIP 压缩包
+                        </button>
+                        <button id="tab-audio" class="tab-btn whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm text-gray-500 hover:text-gray-700">
+                            WAV 转 MP3
                         </button>
                     </nav>
                 </div>
@@ -49,6 +56,33 @@
                             <input id="file-input-zip" type="file" accept=".zip,application/zip,application/x-zip-compressed">
                         </label>
                     </div>
+                    <!-- 直接上传 WAV 转 MP3 -->
+                    <div id="panel-audio" class="tab-content">
+                        <label for="file-input-audio" class="drop-zone cursor-pointer flex flex-col items-center justify-center border-2 border-dashed border-gray-300 rounded-2xl p-12 text-center transition-all duration-300 ease-in-out hover:border-blue-500 hover:bg-blue-50">
+                            <svg class="w-16 h-16 text-gray-400 mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 9l10.5-3m0 6.553v3.75a2.25 2.25 0 01-1.632 2.163l-1.32.377a1.803 1.803 0 11-.99-3.467l2.31-.66a2.25 2.25 0 001.632-2.163zm0 0V2.25L9 5.25v10.303m0 0v3.75a2.25 2.25 0 01-1.632 2.163l-1.32.377a1.803 1.803 0 01-.99-3.467l2.31-.66A2.25 2.25 0 009 15.553z" /></svg>
+                            <span class="font-semibold text-gray-600">点击选择或拖拽多个 .wav 文件</span>
+                            <p class="text-sm text-gray-500 mt-1">转码为最高 320 kbps 的 MP3，方便和 LRC 歌词一起放进播放器</p>
+                            <input id="file-input-audio" type="file" multiple accept=".wav,audio/wav,audio/x-wav,audio/wave">
+                        </label>
+                        <div class="mt-4 flex items-center gap-3 flex-wrap">
+                            <label for="file-input-cover" class="cursor-pointer text-sm font-medium text-blue-600 hover:text-blue-700 border border-blue-200 bg-blue-50 rounded-lg px-3 py-1.5">
+                                选择封面图片（可选）
+                            </label>
+                            <input id="file-input-cover" type="file" accept="image/*">
+                            <span id="cover-file-name" class="text-sm text-gray-500"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 音频转码选项 -->
+                <div id="audio-options" class="mt-6 hidden">
+                    <div id="transcode-option" class="hidden">
+                        <label class="flex items-center gap-2 cursor-pointer select-none">
+                            <input type="checkbox" id="transcode-wav-checkbox" class="w-4 h-4 text-blue-500 rounded border-gray-300 focus:ring-blue-500" checked>
+                            <span class="text-sm text-gray-700">把包内 WAV 转码为 MP3（体积可缩小约 80%）</span>
+                        </label>
+                    </div>
+                    <p id="lame-status" class="text-xs text-gray-400 mt-2"></p>
                 </div>
 
                 <!-- 平铺选项 -->
@@ -61,7 +95,7 @@
 
                 <!-- 文件列表 -->
                 <div id="file-list-container" class="mt-8 hidden">
-                    <h2 class="text-lg font-semibold text-gray-700 mb-2">待处理 VTT 文件</h2>
+                    <h2 id="file-list-title" class="text-lg font-semibold text-gray-700 mb-2">待处理 VTT 文件</h2>
                     <div id="file-list" class="space-y-2 max-h-60 overflow-y-auto pr-2"></div>
                 </div>
                 <!-- 图片预览 -->
@@ -73,19 +107,28 @@
                 <!-- 提示信息 -->
                 <div id="status-message" class="text-center mt-4 text-red-500 font-medium"></div>
 
+                <!-- 转码进度 -->
+                <div id="progress-container" class="mt-4 hidden">
+                    <div class="h-2 w-full bg-gray-200 rounded-full overflow-hidden">
+                        <div id="progress-bar" class="h-full w-0 bg-blue-500 transition-all duration-150"></div>
+                    </div>
+                    <p id="progress-text" class="text-xs text-gray-500 mt-2 text-center"></p>
+                </div>
+
                 <!-- 操作按钮 -->
                 <div id="action-buttons" class="mt-8 flex flex-col sm:flex-row gap-4 hidden">
                     <button id="convert-btn" class="w-full bg-blue-500 text-white font-bold py-3 px-4 rounded-xl shadow-md hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-all duration-200 btn">
                         <span id="btn-text">转换并下载 ZIP</span>
                         <div id="spinner" class="hidden w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin mx-auto"></div>
                     </button>
-                    <button id="clear-btn" class="w-full sm:w-auto bg-gray-200 text-gray-700 font-bold py-3 px-6 rounded-xl hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-400 transition-all duration-200 btn">清空</button>
+                    <button id="clear-btn" class="w-full sm:w-auto shrink-0 whitespace-nowrap bg-gray-200 text-gray-700 font-bold py-3 px-6 rounded-xl hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-400 transition-all duration-200 btn">清空</button>
                 </div>
             </main>
         </div>
-        <div class="text-center text-xs text-gray-400 pb-4">v1.4.0</div>
+        <div class="text-center text-xs text-gray-400 pb-4">v1.5.0</div>
     </div>
 
+    <script src="audio.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

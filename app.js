@@ -1,12 +1,18 @@
 // DOM 元素
 const tabDirect = document.getElementById('tab-direct');
 const tabZip = document.getElementById('tab-zip');
+const tabAudio = document.getElementById('tab-audio');
 const panelDirect = document.getElementById('panel-direct');
 const panelZip = document.getElementById('panel-zip');
+const panelAudio = document.getElementById('panel-audio');
 const dropZones = document.querySelectorAll('.drop-zone');
 const fileInputDirect = document.getElementById('file-input-direct');
 const fileInputZip = document.getElementById('file-input-zip');
+const fileInputAudio = document.getElementById('file-input-audio');
+const fileInputCover = document.getElementById('file-input-cover');
+const coverFileName = document.getElementById('cover-file-name');
 const fileListContainer = document.getElementById('file-list-container');
+const fileListTitle = document.getElementById('file-list-title');
 const fileList = document.getElementById('file-list');
 const actionButtons = document.getElementById('action-buttons');
 const convertBtn = document.getElementById('convert-btn');
@@ -18,18 +24,42 @@ const flattenOption = document.getElementById('flatten-option');
 const flattenCheckbox = document.getElementById('flatten-checkbox');
 const imagePreviewContainer = document.getElementById('image-preview-container');
 const imagePreviewGrid = document.getElementById('image-preview-grid');
+const audioOptions = document.getElementById('audio-options');
+const transcodeOption = document.getElementById('transcode-option');
+const transcodeWavCheckbox = document.getElementById('transcode-wav-checkbox');
+const lameStatus = document.getElementById('lame-status');
+const progressContainer = document.getElementById('progress-container');
+const progressBar = document.getElementById('progress-bar');
+const progressText = document.getElementById('progress-text');
 
 // 状态
 let filesToProcess = []; // 统一存储待处理文件 { name, getContent }
+let audioFilesToProcess = []; // 待转码的 WAV File 对象
+let audioFileStatusNodes = []; // 文件列表里每行的状态节点
 let loadedZip = null; // 存储上传的 ZIP 对象
 let originalInputName = null; // 存储原始输入文件名
 let zipImages = []; // { name, mime, base64 }
 let selectedCoverImage = null; // { mime, base64 } 或 null
+let currentTab = 'direct'; // direct | zip | audio
+let zipHasMp3 = false; // 包内是否有 MP3（用于文件列表提示）
+let zipWavCount = 0; // 包内 WAV 数量
+
+// 固定 320 kbps：WAV 是无损 PCM，等效码率（CD 音质约 1411 kbps）远高于 320，
+// 没有"源码率"可继承，所以一律按 320 kbps 编码；只有采样率过低时
+// （16~24 kHz 上限 160 kbps，≤12 kHz 上限 64 kbps）才会自动降到上限。
+const MP3_BITRATE = 320;
+
+const TAB_ELEMENTS = {
+    direct: { tab: tabDirect, panel: panelDirect },
+    zip: { tab: tabZip, panel: panelZip },
+    audio: { tab: tabAudio, panel: panelAudio }
+};
 
 // --- 事件监听 ---
 
 tabDirect.addEventListener('click', () => switchTab('direct'));
 tabZip.addEventListener('click', () => switchTab('zip'));
+tabAudio.addEventListener('click', () => switchTab('audio'));
 
 dropZones.forEach(zone => {
     zone.addEventListener('dragover', e => {
@@ -46,10 +76,14 @@ dropZones.forEach(zone => {
         zone.classList.remove('dragover');
 
         const files = e.dataTransfer.files;
-        if (zone.parentElement.id === 'panel-direct') {
-            handleDirectFiles(files);
-        } else {
+        const panel = zone.closest('.tab-content');
+
+        if (panel && panel.id === 'panel-audio') {
+            handleAudioFiles(files);
+        } else if (panel && panel.id === 'panel-zip') {
             if (files.length) handleZipFile(files[0]);
+        } else {
+            handleDirectFiles(files);
         }
     });
 });
@@ -62,8 +96,20 @@ fileInputZip.addEventListener('change', e => {
     if (e.target.files.length) handleZipFile(e.target.files[0]);
 });
 
+fileInputAudio.addEventListener('change', e => {
+    handleAudioFiles(e.target.files);
+});
+
+fileInputCover.addEventListener('change', e => {
+    if (e.target.files.length) handleCoverFile(e.target.files[0]);
+});
+
+transcodeWavCheckbox.addEventListener('change', refreshZipFileList);
+
 convertBtn.addEventListener('click', convertAndDownload);
 clearBtn.addEventListener('click', clearFiles);
+
+updateLameStatus();
 
 // --- 基础工具函数 ---
 
@@ -76,8 +122,9 @@ function escapeHtml(value) {
         .replace(/'/g, '&#039;');
 }
 
-function showStatusMessage(message) {
+function showStatusMessage(message, isError = true) {
     statusMessage.textContent = message;
+    statusMessage.className = `text-center mt-4 font-medium ${isError ? 'text-red-500' : 'text-green-600'}`;
 }
 
 function joinZipPath(folder, name) {
@@ -102,50 +149,117 @@ function isMp3File(filename) {
     return /\.mp3$/i.test(filename);
 }
 
+function isWavFile(filename) {
+    return /\.wav$/i.test(filename);
+}
+
+function toMp3Filename(filename) {
+    return String(filename).replace(/\.wav$/i, '.mp3');
+}
+
 function isZipFile(file) {
     if (!file) return false;
     return file.type.includes('zip') || /\.zip$/i.test(file.name);
 }
 
+// --- 进度显示 ---
+
+function setProgress(ratio, text) {
+    const percent = Math.max(0, Math.min(100, Math.round(ratio * 100)));
+
+    progressContainer.classList.remove('hidden');
+    progressBar.style.width = `${percent}%`;
+
+    if (text !== undefined) {
+        progressText.textContent = text;
+    }
+}
+
+function hideProgress() {
+    progressContainer.classList.add('hidden');
+    progressBar.style.width = '0%';
+    progressText.textContent = '';
+}
+
+// --- 编码库状态 ---
+
+function updateLameStatus() {
+    if (typeof WavToMp3 === 'undefined') {
+        lameStatus.textContent = '⚠ 转码模块 audio.js 未加载，无法转码 WAV。';
+        lameStatus.className = 'text-xs text-red-500 mt-2';
+        return;
+    }
+
+    if (WavToMp3.isLamejsReady()) {
+        lameStatus.textContent = 'MP3 编码由 lamejs（LAME 3.x 移植）在本地完成，320 kbps CBR；源采样率过低时会自动降到该采样率的上限。文件不会上传到任何服务器。';
+        lameStatus.className = 'text-xs text-gray-400 mt-2';
+    } else {
+        lameStatus.textContent = '⚠ MP3 编码库 lamejs 未加载（可能是网络问题），请刷新页面后重试。';
+        lameStatus.className = 'text-xs text-red-500 mt-2';
+    }
+}
+
 // --- 页面状态 ---
 
 function switchTab(tabName) {
-    if (tabName === 'direct') {
-        tabDirect.classList.add('active');
-        tabZip.classList.remove('active');
-        panelDirect.classList.add('active');
-        panelZip.classList.remove('active');
-        flattenOption.classList.add('hidden');
-    } else {
-        tabDirect.classList.remove('active');
-        tabZip.classList.add('active');
-        panelDirect.classList.remove('active');
-        panelZip.classList.add('active');
-        flattenOption.classList.remove('hidden');
-    }
+    currentTab = tabName;
+
+    Object.keys(TAB_ELEMENTS).forEach(name => {
+        const isActive = name === tabName;
+        const elements = TAB_ELEMENTS[name];
+
+        elements.tab.classList.toggle('active', isActive);
+        elements.tab.classList.toggle('text-gray-500', !isActive);
+        elements.tab.classList.toggle('hover:text-gray-700', !isActive);
+        elements.panel.classList.toggle('active', isActive);
+    });
+
+    flattenOption.classList.toggle('hidden', tabName !== 'zip');
+    audioOptions.classList.toggle('hidden', tabName === 'direct');
+    transcodeOption.classList.toggle('hidden', tabName !== 'zip');
 
     clearFiles();
+    updateActionButtonText();
+}
+
+function updateActionButtonText() {
+    if (currentTab === 'audio') {
+        btnText.textContent = audioFilesToProcess.length > 1 ? '转码并下载 ZIP' : '转码并下载 MP3';
+        return;
+    }
+
+    btnText.textContent = '转换并下载 ZIP';
 }
 
 function clearFiles() {
     filesToProcess = [];
+    audioFilesToProcess = [];
+    audioFileStatusNodes = [];
     loadedZip = null;
     originalInputName = null;
     zipImages = [];
     selectedCoverImage = null;
+    zipHasMp3 = false;
+    zipWavCount = 0;
 
     imagePreviewGrid.innerHTML = '';
     imagePreviewContainer.classList.add('hidden');
 
     fileInputDirect.value = '';
     fileInputZip.value = '';
+    fileInputAudio.value = '';
+    fileInputCover.value = '';
+    coverFileName.textContent = '';
 
     fileList.innerHTML = '';
+    fileListTitle.textContent = '待处理 VTT 文件';
     fileListContainer.classList.add('hidden');
     actionButtons.classList.add('hidden');
 
+    hideProgress();
     showStatusMessage('');
     setButtonLoading(false);
+    updateActionButtonText();
 }
 
 function setButtonLoading(isLoading) {
@@ -163,9 +277,13 @@ function setButtonLoading(isLoading) {
 // --- 文件处理 ---
 
 function handleDirectFiles(inputFileList) {
+    // 必须先快照：clearFiles() 会把 input.value 置空，
+    // 而 Chrome 返回的 FileList 是"实时"的同一个对象，置空后它也会变空
+    const selectedFiles = Array.from(inputFileList);
+
     clearFiles();
 
-    const vttFiles = Array.from(inputFileList).filter(file => isVttFile(file.name));
+    const vttFiles = selectedFiles.filter(file => isVttFile(file.name));
 
     if (vttFiles.length === 0) {
         showStatusMessage('请选择 .vtt 文件。');
@@ -196,6 +314,7 @@ async function handleZipFile(zipFile) {
 
         const vttZipEntries = [];
         let hasMp3 = false;
+        let wavCount = 0;
 
         for (const filename in loadedZip.files) {
             const entry = loadedZip.files[filename];
@@ -208,6 +327,10 @@ async function handleZipFile(zipFile) {
             if (isMp3File(filename)) {
                 hasMp3 = true;
             }
+
+            if (isWavFile(filename)) {
+                wavCount++;
+            }
         }
 
         filesToProcess = vttZipEntries.map(entry => ({
@@ -215,7 +338,7 @@ async function handleZipFile(zipFile) {
             getContent: () => entry.async('string')
         }));
 
-        updateFileListUI(hasMp3);
+        updateFileListUI(hasMp3, wavCount);
         await extractAndDisplayImages();
     } catch (error) {
         console.error('解压文件时出错:', error);
@@ -224,22 +347,133 @@ async function handleZipFile(zipFile) {
     }
 }
 
-function updateFileListUI(hasMp3 = false) {
-    if (filesToProcess.length === 0) {
-        if (hasMp3) {
-            showStatusMessage('');
-            fileList.innerHTML = '<li class="text-sm text-gray-500 p-3">未找到 VTT 文件，将仅处理 MP3 封面嵌入</li>';
-            fileListContainer.classList.remove('hidden');
-            actionButtons.classList.remove('hidden');
-        } else {
-            showStatusMessage('在上传的文件中未找到任何 .vtt 或 .mp3 文件。');
-            fileListContainer.classList.add('hidden');
-            actionButtons.classList.add('hidden');
-        }
+// --- WAV 文件处理（音频转码模式）---
+
+function handleAudioFiles(inputFileList) {
+    // 先选封面、再选音频时，封面不应该被清掉
+    const previousImages = zipImages;
+    const previousCover = selectedCoverImage;
+
+    // 同样先快照：clearFiles() 会把 input.value 置空，FileList 会跟着变空
+    const selectedFiles = Array.from(inputFileList);
+
+    clearFiles();
+
+    const wavFiles = selectedFiles.filter(file => isWavFile(file.name));
+
+    if (wavFiles.length === 0) {
+        showStatusMessage('请选择 .wav 文件。');
         return;
     }
 
+    originalInputName = wavFiles[0].name;
+    audioFilesToProcess = wavFiles;
+
+    if (previousCover) {
+        zipImages = previousImages;
+        selectedCoverImage = previousCover;
+        coverFileName.textContent = previousCover.name || '';
+        renderImageGrid();
+    }
+
+    renderAudioFileList();
+    updateActionButtonText();
+    showStatusMessage('');
+}
+
+async function handleCoverFile(file) {
+    if (!file.type.startsWith('image/')) {
+        showStatusMessage('封面必须是图片文件。');
+        return;
+    }
+
+    try {
+        const base64 = await blobToBase64(file);
+        const image = {
+            name: file.name,
+            mime: file.type || 'image/jpeg',
+            base64
+        };
+
+        zipImages = [image];
+        selectedCoverImage = {
+            name: image.name,
+            mime: image.mime,
+            base64: image.base64
+        };
+        coverFileName.textContent = file.name;
+
+        renderImageGrid();
+        showStatusMessage('');
+    } catch (error) {
+        console.error('读取封面图片失败:', error);
+        showStatusMessage('读取封面图片失败。');
+    }
+}
+
+function renderAudioFileList() {
     fileList.innerHTML = '';
+    audioFileStatusNodes = [];
+
+    audioFilesToProcess.forEach(file => {
+        const li = document.createElement('li');
+        li.className = 'list-item flex items-center justify-between bg-gray-50 p-3 rounded-lg';
+
+        const safeName = escapeHtml(file.name);
+
+        li.innerHTML = `
+            <span class="text-sm font-medium text-gray-700 truncate" title="${safeName}">${safeName}</span>
+            <span class="text-sm text-gray-400 shrink-0 ml-2" data-role="status">${WavToMp3.formatBytes(file.size)}</span>
+        `;
+
+        fileList.appendChild(li);
+        audioFileStatusNodes.push(li.querySelector('[data-role="status"]'));
+    });
+
+    fileListTitle.textContent = '待转码 WAV 文件';
+    fileListContainer.classList.remove('hidden');
+    actionButtons.classList.remove('hidden');
+}
+
+function setAudioFileStatus(index, text, tone = 'muted') {
+    const node = audioFileStatusNodes[index];
+
+    if (!node) return;
+
+    const colors = {
+        muted: 'text-gray-400',
+        done: 'text-green-600',
+        error: 'text-red-500'
+    };
+
+    node.textContent = text;
+    node.className = `text-sm shrink-0 ml-2 ${colors[tone] || colors.muted}`;
+}
+
+function updateFileListUI(hasMp3 = false, wavCount = 0) {
+    zipHasMp3 = hasMp3;
+    zipWavCount = wavCount;
+
+    const willTranscode = wavCount > 0 && transcodeWavCheckbox.checked;
+    const hasWork = filesToProcess.length > 0 || hasMp3 || willTranscode;
+
+    if (!hasWork) {
+        showStatusMessage('在上传的文件中未找到任何 .vtt、.mp3 或 .wav 文件。');
+        fileListContainer.classList.add('hidden');
+        actionButtons.classList.add('hidden');
+        return;
+    }
+
+    showStatusMessage('');
+    fileList.innerHTML = '';
+
+    if (filesToProcess.length === 0) {
+        const li = document.createElement('li');
+
+        li.className = 'text-sm text-gray-500 p-3';
+        li.textContent = hasMp3 ? '未找到 VTT 文件，将仅处理 MP3 封面嵌入' : '未找到 VTT 文件';
+        fileList.appendChild(li);
+    }
 
     filesToProcess.forEach(file => {
         const li = document.createElement('li');
@@ -255,8 +489,35 @@ function updateFileListUI(hasMp3 = false) {
         fileList.appendChild(li);
     });
 
+    renderZipWavNote();
+
     fileListContainer.classList.remove('hidden');
     actionButtons.classList.remove('hidden');
+}
+
+/** 在文件列表里提示包内 WAV 会被转码还是原样保留 */
+function renderZipWavNote() {
+    const existing = document.getElementById('zip-wav-note');
+
+    if (existing) existing.remove();
+
+    if (!loadedZip || !zipWavCount) return;
+
+    const li = document.createElement('li');
+
+    li.id = 'zip-wav-note';
+    li.className = 'text-sm text-blue-700 bg-blue-50 p-3 rounded-lg';
+    li.textContent = transcodeWavCheckbox.checked
+        ? `另有 ${zipWavCount} 个 WAV 文件将转码为 320 kbps 的 MP3`
+        : `另有 ${zipWavCount} 个 WAV 文件将原样保留（未勾选转码）`;
+
+    fileList.appendChild(li);
+}
+
+function refreshZipFileList() {
+    if (!loadedZip) return;
+
+    updateFileListUI(zipHasMp3, zipWavCount);
 }
 
 // --- VTT 转 LRC ---
@@ -409,6 +670,11 @@ function renderImageGrid() {
         wrapper.appendChild(image);
         wrapper.appendChild(check);
 
+        // 保留已有选择（例如先选封面再选音频文件时）
+        if (selectedCoverImage && selectedCoverImage.base64 === img.base64) {
+            wrapper.classList.add('selected');
+        }
+
         wrapper.addEventListener('click', () => selectCoverImage(index));
         imagePreviewGrid.appendChild(wrapper);
     });
@@ -429,6 +695,7 @@ function selectCoverImage(index) {
     wrappers[index].classList.add('selected');
 
     selectedCoverImage = {
+        name: zipImages[index].name,
         mime: zipImages[index].mime,
         base64: zipImages[index].base64
     };
@@ -854,13 +1121,22 @@ function createFlattenedName(filename, existingNames) {
     const hasPath = pathParts.length > 0;
     const pathStr = pathParts.join('_');
 
-    const isMusicOrSubtitle = /\.(mp3|wav|lrc|ogg|flac|aac|m4a)$/i.test(baseName);
+    const isMusicOrSubtitle = /\.(mp3|wav|lrc|ogg|flac|aac|m4a)$/i.test(baseName) ||
+        // 歌曲.wav.vtt 这类字幕输出的是 歌曲.lrc，要和 歌曲.mp3 同名，
+        // 所以按音乐文件的方式加路径后缀，否则和音频文件名对不上
+        /\.(mp3|wav|ogg|flac|aac|m4a)\.vtt$/i.test(baseName);
 
     let newName = baseName;
 
     if (existingNames.has(newName)) {
         if (isMusicOrSubtitle && hasPath) {
-            newName = baseName.replace(/\.[^.]+$/, `_${pathStr}$&`);
+            // 歌曲.wav -> 歌曲_作品A.wav
+            // 歌曲.wav.vtt -> 歌曲_作品A.wav.vtt（后缀插在音频扩展名之前，
+            // 这样转出来的 歌曲_作品A.lrc 才能和 歌曲_作品A.mp3 同名）
+            const vttSuffix = /\.vtt$/i.test(baseName) ? baseName.slice(-4) : '';
+            const stem = vttSuffix ? baseName.slice(0, -4) : baseName;
+
+            newName = stem.replace(/\.[^.]+$/, `_${pathStr}$&`) + vttSuffix;
         } else if (!isMusicOrSubtitle && hasPath) {
             newName = `${pathStr}_${baseName}`;
         } else {
@@ -896,6 +1172,13 @@ function addNumberSuffixUntilUnique(filename, existingNames) {
 // --- 转换与下载 ---
 
 async function convertAndDownload() {
+    if (currentTab === 'audio') {
+        if (audioFilesToProcess.length === 0) return;
+
+        await convertAudioFiles();
+        return;
+    }
+
     if (filesToProcess.length === 0 && !loadedZip) return;
 
     setButtonLoading(true);
@@ -904,30 +1187,205 @@ async function convertAndDownload() {
     try {
         const outputZip = new JSZip();
 
-        if (loadedZip) {
-            await processZipMode(outputZip);
-        } else {
-            await processDirectVttMode(outputZip);
-        }
+        const result = loadedZip
+            ? await processZipMode(outputZip)
+            : await processDirectVttMode(outputZip);
 
         const zipBlob = await outputZip.generateAsync({
             type: 'blob'
         });
 
         downloadBlob(zipBlob, getDownloadName());
-        showStatusMessage('处理完成。');
+
+        const warnings = (result && result.warnings) || [];
+
+        if (warnings.length > 0) {
+            showStatusMessage(`处理完成，但有以下文件未能转码：${warnings.join('；')}`);
+        } else {
+            showStatusMessage('处理完成。', false);
+        }
     } catch (error) {
         console.error('转换或下载过程中发生错误:', error);
         showStatusMessage(`处理失败：${error.message || '请在控制台查看错误信息。'}`);
     } finally {
         setButtonLoading(false);
+        hideProgress();
     }
+}
+
+// --- WAV 转 MP3 ---
+
+async function convertAudioFiles() {
+    setButtonLoading(true);
+    showStatusMessage('');
+    setProgress(0, '准备转码…');
+
+    const startedAt = Date.now();
+
+    try {
+        const result = await processAudioMode();
+        const outputs = result.outputs;
+        const failures = result.failures;
+        const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+
+        if (outputs.length === 0) {
+            throw new Error(failures.join('；') || '没有可用的输出。');
+        }
+
+        if (outputs.length === 1) {
+            downloadBlob(new Blob([outputs[0].buffer], {
+                type: 'audio/mpeg'
+            }), outputs[0].name);
+        } else {
+            const outputZip = new JSZip();
+            const usedNames = new Set();
+
+            outputs.forEach(output => {
+                const name = usedNames.has(output.name)
+                    ? addNumberSuffixUntilUnique(output.name, usedNames)
+                    : output.name;
+
+                usedNames.add(name);
+                outputZip.file(name, new Blob([output.buffer], {
+                    type: 'audio/mpeg'
+                }));
+            });
+
+            const zipBlob = await outputZip.generateAsync({
+                type: 'blob'
+            });
+
+            downloadBlob(zipBlob, getAudioDownloadName(outputs.length));
+        }
+
+        if (failures.length > 0) {
+            showStatusMessage(`完成 ${outputs.length} 个，失败 ${failures.length} 个：${failures.join('；')}`);
+        } else {
+            setProgress(1, `全部完成，用时 ${elapsed} 秒`);
+            showStatusMessage('');
+        }
+    } catch (error) {
+        console.error('WAV 转 MP3 失败:', error);
+        showStatusMessage(`转码失败：${error.message || '请在控制台查看错误信息。'}`);
+        hideProgress();
+    } finally {
+        setButtonLoading(false);
+    }
+}
+
+async function processAudioMode() {
+    const bitrate = MP3_BITRATE;
+    const total = audioFilesToProcess.length;
+    const outputs = [];
+    const failures = [];
+
+    for (let index = 0; index < total; index++) {
+        const file = audioFilesToProcess[index];
+        const label = total > 1 ? `(${index + 1}/${total}) ${file.name}` : file.name;
+
+        setAudioFileStatus(index, '转码中…');
+
+        try {
+            const arrayBuffer = await file.arrayBuffer();
+
+            const result = await WavToMp3.wavToMp3(arrayBuffer, {
+                bitrate,
+                onProgress: (ratio, message) => setProgress((index + ratio) / total, `${label} — ${message || ''}`)
+            });
+
+            let outputBuffer = result.data.buffer;
+
+            if (selectedCoverImage) {
+                setProgress((index + 0.98) / total, `${label} — 正在写入封面…`);
+
+                outputBuffer = await addId3v2Cover(
+                    outputBuffer,
+                    selectedCoverImage.base64,
+                    selectedCoverImage.mime,
+                    {
+                        title: file.name.replace(/\.wav$/i, '')
+                    }
+                );
+            }
+
+            outputs.push({
+                name: toMp3Filename(file.name),
+                buffer: outputBuffer,
+                result
+            });
+
+            const limitedNote = result.bitrateLimited
+                ? `（源采样率 ${result.sampleRate} Hz，上限 ${result.bitrate} kbps）`
+                : '';
+
+            setAudioFileStatus(
+                index,
+                `完成 · ${result.bitrate} kbps · ${WavToMp3.formatBytes(outputBuffer.byteLength)}${limitedNote}`,
+                'done'
+            );
+        } catch (error) {
+            // 单个文件坏掉不应该影响整批
+            console.error(`转码失败：${file.name}`, error);
+            failures.push(`${file.name}：${error.message}`);
+            setAudioFileStatus(index, `失败：${error.message}`, 'error');
+        }
+    }
+
+    return { outputs, failures };
+}
+
+function getAudioDownloadName(count) {
+    const baseName = originalInputName ? originalInputName.replace(/\.wav$/i, '') : 'audio';
+
+    return `${baseName}等${count}个_mp3.zip`;
+}
+
+// --- ZIP 模式内的 WAV 转码 ---
+
+function countZipWavFiles() {
+    let count = 0;
+
+    for (const filename in loadedZip.files) {
+        if (!loadedZip.files[filename].dir && isWavFile(filename)) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+function uniqueOutputName(candidate, takenNames) {
+    const name = takenNames.has(candidate)
+        ? addNumberSuffixUntilUnique(candidate, takenNames)
+        : candidate;
+
+    takenNames.add(name);
+
+    return name;
 }
 
 async function processZipMode(outputZip) {
     const shouldFlatten = flattenCheckbox.checked;
+    const shouldTranscodeWav = transcodeWavCheckbox.checked;
+    const bitrate = MP3_BITRATE;
     const existingNames = new Set();
     const outputFolder = getOutputFolderNameFromZip(loadedZip);
+
+    // 非平铺模式保留原始路径，先把所有原始文件名登记下来，
+    // 免得转码出来的 MP3 覆盖掉包内同名的 MP3
+    const reservedNames = new Set();
+
+    if (!shouldFlatten) {
+        for (const filename in loadedZip.files) {
+            if (!loadedZip.files[filename].dir) {
+                reservedNames.add(filename);
+            }
+        }
+    }
+
+    const wavCount = shouldTranscodeWav ? countZipWavFiles() : 0;
+    const warnings = [];
+    let wavIndex = 0;
 
     for (const filename in loadedZip.files) {
         const zipEntry = loadedZip.files[filename];
@@ -945,6 +1403,60 @@ async function processZipMode(outputZip) {
                 : getLrcFilename(filename);
 
             outputZip.file(joinZipPath(outputFolder, lrcFilename), lrcContent);
+            continue;
+        }
+
+        if (isWavFile(filename) && shouldTranscodeWav) {
+            wavIndex++;
+
+            const mp3Name = uniqueOutputName(
+                toMp3Filename(newName),
+                shouldFlatten ? existingNames : reservedNames
+            );
+
+            const label = wavCount > 1
+                ? `(${wavIndex}/${wavCount}) ${getBaseName(filename)}`
+                : getBaseName(filename);
+
+            try {
+                const arrayBuffer = await zipEntry.async('arraybuffer');
+
+                const result = await WavToMp3.wavToMp3(arrayBuffer, {
+                    bitrate,
+                    onProgress: (ratio, message) => setProgress(
+                        (wavIndex - 1 + ratio) / wavCount,
+                        `转码 WAV ${label} — ${message || ''}`
+                    )
+                });
+
+                let outputBuffer = result.data.buffer;
+
+                if (selectedCoverImage) {
+                    setProgress((wavIndex - 0.02) / wavCount, `转码 WAV ${label} — 正在写入封面…`);
+
+                    outputBuffer = await addId3v2Cover(
+                        outputBuffer,
+                        selectedCoverImage.base64,
+                        selectedCoverImage.mime,
+                        {
+                            title: getBaseName(filename).replace(/\.[^.]+$/, '')
+                        }
+                    );
+                }
+
+                outputZip.file(joinZipPath(outputFolder, mp3Name), new Blob([outputBuffer], {
+                    type: 'audio/mpeg'
+                }));
+            } catch (error) {
+                // 转码失败就原样保留，不打断整包处理
+                console.error(`WAV 转码失败：${filename}`, error);
+                warnings.push(`${getBaseName(filename)}（${error.message}）`);
+
+                const fileContent = await zipEntry.async('blob');
+
+                outputZip.file(joinZipPath(outputFolder, newName), fileContent);
+            }
+
             continue;
         }
 
@@ -975,6 +1487,8 @@ async function processZipMode(outputZip) {
         const fileContent = await zipEntry.async('blob');
         outputZip.file(joinZipPath(outputFolder, newName), fileContent);
     }
+
+    return { warnings };
 }
 
 async function processDirectVttMode(outputZip) {
