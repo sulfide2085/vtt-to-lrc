@@ -88,11 +88,6 @@
         return dotIndex > 0 ? base.slice(dotIndex).toLowerCase() : '';
     }
 
-    /** 文件夹模式关心的文件类型（其余文件原样不动） */
-    function isRelevantFile(filePath) {
-        return /\.(vtt|wav|mp3)$/i.test(filePath) || IMAGE_EXTENSIONS.test(filePath);
-    }
-
     // --- 选择目录 ---
 
     /**
@@ -191,8 +186,9 @@
                     continue;
                 }
 
-                if (!isRelevantFile(childPath)) continue;
-
+                // 所有文件都收进来，不只 VTT / WAV / MP3 / 图片：
+                // 平铺要把整个目录树都展开，漏掉的文件会留在子目录里挡住清理；
+                // 只读模式下这些文件也会原样进 ZIP，和压缩包模式的行为一致。
                 let size = 0;
                 let lastModified = 0;
 
@@ -382,8 +378,6 @@
 
             const relPath = segments.concat(fileName).join('/');
 
-            if (!isRelevantFile(relPath)) continue;
-
             let cursor = root;
 
             for (const segment of segments) {
@@ -437,7 +431,6 @@
         canWriteDirectory,
         canWriteFile,
         isAbortError,
-        isRelevantFile,
         mimeForPath,
         getBaseName,
         getExtension,

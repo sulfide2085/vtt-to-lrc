@@ -1947,6 +1947,36 @@ function resolveOutputNames(entries, job) {
 }
 
 /**
+ * 平铺：把子目录里的"原样保留"文件也搬到根目录。
+ *
+ * 压缩包模式的平铺是把所有条目都放进包根，所以文件夹模式也得全搬——只搬本次
+ * 处理过的音频/字幕，会留下"音频在根目录、图片和文档还在子目录里"的半吊子状态，
+ * 目录树根本没被展开。
+ *
+ * 只挂到虚拟条目上（内存里），真正落盘由写回流程负责：先把文件复制到根目录，
+ * 全部成功之后再删原位置，中途失败至少不会把文件弄丢。
+ */
+function movePassThroughFiles(entries, job) {
+    if (!job.shouldFlatten) return entries;
+
+    entries.forEach(entry => {
+        // 处理过的文件会在根目录生成新文件（LRC / MP3），不能算"原样搬动"。
+        // 注意不能用 entry.outputName 判断：resolveOutputNames 已经给每个条目都
+        // 算好了平铺名，那个字段永远有值。
+        const isProcessed = entry.kind === 'vtt'
+            || (entry.kind === 'wav' && job.shouldTranscodeWav)
+            || (entry.kind === 'mp3' && job.coverImage);
+
+        // 本来就在根目录的文件不用动
+        if (isProcessed || !entry.relPath.includes('/')) return;
+
+        entry.movedAsIs = true;
+    });
+
+    return entries;
+}
+
+/**
  * 平铺会把这些文件搬到根目录，重名时只能"跳过"而不是改名字
  * （改名字会让 歌曲.mp3 和 歌曲.lrc 对不上）。
  * 所以先在界面上说清风险，而不是等用户确认后才发现一半文件没写。
@@ -1962,7 +1992,7 @@ function buildFlattenHint(job) {
 
     if (nested === 0) return '';
 
-    return `已勾选平铺：${nested} 个子目录里的文件会被搬到根目录，重名的（比如不同作品下同名的 01.mp3）只会写第一个，其余跳过。建议不勾选平铺。`;
+    return `已勾选平铺：${nested} 个子目录里的文件（含图片、文档等原样保留的文件）会被搬到根目录，被搬空的子目录会一起清理；重名的自动加路径前缀，例如 第一話/info.txt → 第一話_info.txt。`;
 }
 
 // --- 转换与下载 ---
@@ -2385,7 +2415,7 @@ function emptyDirectoryChain(counts, relativeDir) {
 async function planFolderWrites(entries, job) {
     const targets = [];
     const skipped = [];
-    const plan = { writes: [], newFiles: [], overwrites: [], deletes: [], removeDirs: [], skipped };
+    const plan = { writes: [], moves: [], newFiles: [], overwrites: [], deletes: [], removeDirs: [], skipped };
 
     /**
      * 平铺是把文件"搬"到根目录，不是复制一份：新位置写好后必须收掉原位置的旧文件，
@@ -2397,6 +2427,20 @@ async function planFolderWrites(entries, job) {
 
     for (const entry of entries) {
         const outputName = entry.outputName;
+
+        // 平铺时原样保留的文件只是被搬到根目录：文件内容不变，写完新位置再删原位置
+        if (entry.movedAsIs) {
+            targets.push({
+                relPath: outputName,
+                source: entry,
+                typeLabel: '移动',
+                deleteOnly: true,
+                build: null,
+                deleteSource: entry.relPath
+            });
+
+            continue;
+        }
 
         if (entry.kind === 'vtt') {
             targets.push({
@@ -2447,7 +2491,7 @@ async function planFolderWrites(entries, job) {
             });
         }
 
-        // 其它文件（图片、文档…）一律不动：平铺只搬本次处理过的文件
+        // 图片、文档等：平铺时上面已经登记为"移动"，不勾平铺就原地不动
     }
 
     // 同名目标只处理一次，例如「歌曲.wav」（转码成 歌曲.mp3）撞上本来就有的「歌曲.mp3」
@@ -2466,9 +2510,14 @@ async function planFolderWrites(entries, job) {
         }
 
         claimed.set(target.relPath, target);
-        plan.writes.push(target);
+
+        // 移动类的目标不写内容，只需要"删掉原位置"，单独放一堆
+        if (target.deleteOnly) plan.moves.push(target);
+        else plan.writes.push(target);
     }
 
+    // 只在有内容要写的时候才查"目标是否已存在"；纯移动的目标必然存在于根目录之外，
+    // 它的重名检查交给上面那个 claimed 表
     const existing = await indexExistingPaths(job.directoryHandle, plan.writes.map(target => target.relPath));
     const deletionSet = new Set();
 
@@ -2478,19 +2527,21 @@ async function planFolderWrites(entries, job) {
         } else {
             plan.newFiles.push(target.relPath);
         }
+    });
 
+    for (const target of plan.writes.concat(plan.moves)) {
         if (target.deleteSource && target.deleteSource !== target.relPath) {
             // 去重：平铺时两个不同作品可能压到同一个输出名，但源文件只会被登记一次
             deletionSet.add(target.deleteSource);
         }
-    });
+    }
 
     plan.deletes = [...deletionSet];
 
     // 平铺模式：把被搬空的子目录一起收掉，否则会出现"文件在根目录、空文件夹留在原地"
     if (job.shouldFlatten) {
-        plan.removeDirs = removableDirectoriesAfterFlatten(job, plan.writes);
-        plan.flatHint = '（转码成功后执行，不可撤销；平铺时源文件由根目录的版本取代）';
+        plan.removeDirs = removableDirectoriesAfterFlatten(job, plan.writes.concat(plan.moves));
+        plan.flatHint = '（平铺时源文件由根目录的版本取代，移动的文件也一并删除原位置）';
     } else {
         plan.flatHint = '（转码成功后执行，不可撤销）';
     }
@@ -2544,7 +2595,7 @@ function openWritebackModal(plan, handle, job) {
     const hint = buildFlattenHint(job);
 
     writebackTarget.textContent =
-        `「${handle.name || '所选文件夹'}」 · ${mode} · 共 ${plan.writes.length} 个文件将被写入`;
+        `「${handle.name || '所选文件夹'}」 · ${mode} · 共 ${plan.writes.length + plan.moves.length} 个文件将被写入`;
 
     writebackSummary.innerHTML =
         (hint ? `<p class="text-xs text-amber-600 mb-3">${escapeHtml(hint)}</p>` : '') +
@@ -2572,7 +2623,7 @@ function closeWritebackModal() {
     modalResolver = null;
 }
 
-/** 写回：逐项转码 → 写入 → 最后删源文件（失败的原样保留） */
+/** 写回：逐项转码 → 写入 → 搬动原样保留的文件 → 删源文件 → 清理空目录 */
 async function executeFolderPlan(plan, job) {
     const handle = job.directoryHandle;
     const warnings = [];
@@ -2580,6 +2631,8 @@ async function executeFolderPlan(plan, job) {
     const failedDirs = [];
     let writtenCount = 0;
     let unchangedCount = 0;
+    let movedCount = 0;
+    let deletedCount = 0;
 
     for (let index = 0; index < plan.writes.length; index++) {
         const target = plan.writes[index];
@@ -2608,10 +2661,36 @@ async function executeFolderPlan(plan, job) {
         }
     }
 
-    for (const relPath of plan.deletes) {
+    // 搬动"原样保留"的文件（平铺）：先复制到根目录，全部复制完再统一删原位置，
+    // 这样即使中途失败也不会出现"两边都没有"的情况
+    const movedSources = [];
+
+    for (let index = 0; index < plan.moves.length; index++) {
+        const target = plan.moves[index];
+
         try {
-            setProgress(0.99, `删除源文件 ${relPath}`);
+            setProgress(0.9 + (index / Math.max(1, plan.moves.length)) * 0.05, `搬动 (${index + 1}/${plan.moves.length}) ${target.source.relPath}`);
+
+            const bytes = await target.source.getBytes();
+
+            await FolderFs.writeFile(handle, target.relPath, bytes);
+            movedSources.push(target.source.relPath);
+            movedCount++;
+        } catch (error) {
+            console.error(`搬动失败：${target.source.relPath}`, error);
+            warnings.push(`${target.source.relPath}（${error.message}）`);
+        }
+    }
+
+    // 删原位置：转码/字幕留下的源文件，加上刚刚搬走的那些。
+    // 搬动失败的文件不在这里（没进 movedSources 也不在 plan.deletes 里），原样留着。
+    const pendingDeletes = plan.deletes.concat(movedSources);
+
+    for (const relPath of pendingDeletes) {
+        try {
+            setProgress(0.96, `删除源文件 ${relPath}`);
             await FolderFs.deleteFile(handle, relPath);
+            deletedCount++;
         } catch (error) {
             console.error(`删除失败：${relPath}`, error);
             failedDeletes.push(`${relPath}（${error.message}）`);
@@ -2620,7 +2699,7 @@ async function executeFolderPlan(plan, job) {
 
     // 最后收掉被搬空的子目录。
     // 计划的清单只是"候选"，真正删之前由 FolderFs.deleteDirectoryIfEmpty 重新确认目录是空的：
-    // 目录里可能还剩扫描时被忽略的文件（txt 之类），删之前再列一遍才不会误删。
+    // 非空就保留（比如里面还有不属于本次处理范围的文件），不会虚报清理数量。
     const removedDirs = [];
     const skippedDirs = [];
 
@@ -2639,7 +2718,7 @@ async function executeFolderPlan(plan, job) {
         }
     }
 
-    return { writtenCount, unchangedCount, warnings, failedDeletes, failedDirs, removedDirs, skippedDirs };
+    return { writtenCount, unchangedCount, movedCount, deletedCount, warnings, failedDeletes, failedDirs, removedDirs, skippedDirs };
 }
 
 function readExistingDigest(handle, relPath) {
@@ -2656,12 +2735,13 @@ async function processFolderWriteBack(job) {
     const entries = await buildVirtualEntries(job);
 
     resolveOutputNames(entries, job);
+    movePassThroughFiles(entries, job);
 
     setProgress(0.01, '正在核对目标文件夹…');
 
     const plan = await planFolderWrites(entries, job);
 
-    if (plan.writes.length === 0) {
+    if (plan.writes.length === 0 && plan.moves.length === 0) {
         showStatusMessage(plan.skipped.length
             ? `没有可写回的文件：${plan.skipped.map(item => `${item.relPath}（${item.reason}）`).join('；')}`
             : '没有需要写回的文件。');
@@ -2681,7 +2761,8 @@ async function processFolderWriteBack(job) {
     const parts = [`已写入 ${result.writtenCount} 个文件`];
 
     if (result.unchangedCount) parts.push(`${result.unchangedCount} 个内容相同已跳过`);
-    if (plan.deletes.length) parts.push(`删除了 ${plan.deletes.length - result.failedDeletes.length} 个源文件`);
+    if (result.movedCount) parts.push(`搬动 ${result.movedCount} 个原样保留的文件`);
+    if (result.deletedCount) parts.push(`删除了 ${result.deletedCount} 个源文件`);
     if (result.removedDirs.length) parts.push(`清理了 ${result.removedDirs.length} 个空目录`);
     if (plan.skipped.length) parts.push(`跳过 ${plan.skipped.length} 个重名输出`);
 
