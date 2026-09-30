@@ -61,8 +61,8 @@ let isProcessing = false; // 正在转换中：禁止切标签/清空/换文件�
 let currentWork = null; // 按 RJ 号查到的作品信息
 let folderStore = null; // { handle, canWrite, rootName } 文件夹模式的写回目标
 let folderScan = null; // { vttCount, wavCount, mp3Count, imageCount, otherCount, skippedDirs, truncated }
-let writebackConfirmHandler = null; // 写回确认弹窗当前的「确认」动作
 let modalResolver = null; // 当前等待用户回答的弹窗
+let folderModeNotice = ''; // 目录选择器失败之类的重要提示，挂在文件夹状态行上常驻显示
 
 /**
  * RJ 元数据服务地址（Cloudflare Worker，部署方法见 worker/README.md）。
@@ -337,6 +337,13 @@ function updateFolderSupport() {
         return;
     }
 
+    // 目录选择器失败留下的提示优先显示：这条要说清"为什么没打开"以及"现在会怎么处理"
+    if (folderModeNotice) {
+        folderStatusText.textContent = folderModeNotice;
+        folderStatusText.className = 'text-xs text-amber-600 mt-2 text-center';
+        return;
+    }
+
     if (FolderFs.isSupported()) {
         folderStatusText.textContent = '可直接写回原文件夹：转换结果覆盖原路径的同名文件，动手前会先列出清单让你确认。';
         folderStatusText.className = 'text-xs text-gray-400 mt-2 text-center';
@@ -403,6 +410,7 @@ function clearFiles() {
     hideProgress();
     showStatusMessage('');
     setButtonLoading(false);
+    updateActionButtonLabel();
 }
 
 function setButtonLoading(isLoading) {
@@ -415,6 +423,19 @@ function setButtonLoading(isLoading) {
         btnText.classList.remove('hidden');
         spinner.classList.add('hidden');
     }
+}
+
+/**
+ * 按钮文案要说清接下来会发生什么：文件夹模式下可能是"写回原路径"，
+ * 也可能是"打包下载"（只读降级）。以前文件夹模式也写着"转换并下载 ZIP"，
+ * 点下去却弹出写回清单，容易让人以为点错了。
+ */
+function updateActionButtonLabel() {
+    const isFolderMode = !!folderStore;
+
+    btnText.textContent = isFolderMode && folderStore.canWrite
+        ? '转换并写回原文件夹'
+        : '转换并下载 ZIP';
 }
 
 /**
@@ -528,7 +549,7 @@ async function handleZipFile(zipFile) {
 
 // --- 文件夹模式：选择与扫描 ---
 
-/** 点「选择文件夹」：优先走可写句柄，浏览器不支持时降级到 <input webkitdirectory> */
+/** 点「选择文件夹」：优先走可写句柄，拿不到就降级为只读读入 + 打包下载（一定有反应） */
 async function pickSourceFolder() {
     if (isProcessing) {
         showStatusMessage('正在转换中，请等当前任务完成后再选择文件夹。');
@@ -540,9 +561,9 @@ async function pickSourceFolder() {
         return;
     }
 
+    // 浏览器没有目录句柄 API（Firefox / Safari）：用 webkitdirectory 只读读入
     if (!FolderFs.isSupported()) {
-        // Firefox / Safari：没有目录句柄 API，用 webkitdirectory 只读读入，结果打包下载
-        fileInputFolder.click();
+        openReadOnlyFolderPicker();
         return;
     }
 
@@ -559,8 +580,11 @@ async function pickSourceFolder() {
             return;
         }
 
-        console.error('选择文件夹失败:', error);
-        showStatusMessage(`选择文件夹失败：${error.message || '浏览器未允许访问'}。`);
+        // 目录句柄 API 失败（权限被拒、没有用户激活、系统不支持…）不能就此结束：
+        // 以前这里只弹一行报错，用户看到的就是"点了没反应"。改为退回只读读入，
+        // 至少还能转换并打包下载。
+        console.error('目录句柄选择器失败，改为只读读入文件夹:', error);
+        openReadOnlyFolderPicker(`无法直接写回原文件夹（${error.name || '错误'}：${error.message || '浏览器未允许访问'}）。已改为只读读入，转换结果会打包成 ZIP 下载。`);
         return;
     }
 
@@ -570,11 +594,26 @@ async function pickSourceFolder() {
     }
 
     if (!picked.supported) {
-        fileInputFolder.click();
+        openReadOnlyFolderPicker();
         return;
     }
 
     await scanFolderHandle(picked.handle, picked.canWrite);
+}
+
+/** 降级入口：用 <input webkitdirectory> 只读读入文件夹（结果打包下载） */
+function openReadOnlyFolderPicker(notice) {
+    if (notice) {
+        // 失败原因挂在文件夹状态行上常驻显示；底部状态栏留着上一句
+        // "请在系统弹窗里选择…"会自相矛盾，所以清掉
+        folderModeNotice = notice;
+        showStatusMessage('');
+        updateFolderSupport();
+    }
+
+    // 真实浏览器里这会同步弹出目录选择器；随后的扫描会把底部状态栏清空，
+    // 所以提示挂在状态行上，不会被清掉
+    fileInputFolder.click();
 }
 
 /** 降级路径：<input webkitdirectory> 或只读的拖拽目录 */
@@ -972,6 +1011,8 @@ function updateFileListUI(hasMp3 = false, wavCount = 0) {
 
     renderZipWavNote();
     renderFolderNote();
+
+    updateActionButtonLabel();
 }
 
 /** 在文件列表里提示包内 WAV 会被转码还是原样保留 */

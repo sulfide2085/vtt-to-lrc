@@ -1755,8 +1755,75 @@ async function main() {
         check('降级后仍能正常读入并转换', degradeEntryResult.count === 2 && degradeEntryResult.sourceKind === 'folder', JSON.stringify(degradeEntryResult));        check('降级路径不可写', degradeEntryResult.writable === false);
         check('降级输出为 LRC 打包下载', sameSet(degradeEntryResult.names, ['第一話.lrc', '第二話.lrc']) && degradeEntryResult.downloadName === '作品_after.zip', JSON.stringify(degradeEntryResult));
 
-        // --- 20. 文件夹模式：<input webkitdirectory> 的路径还原 ---
-        console.log('\n[20] 文件夹模式：webkitdirectory 的目录层级还原');
+        // --- 20. 文件夹模式：目录选择器失败时必须自动降级 ---
+        // 线上真实反馈"点了没反应"：showDirectoryPicker() 在缺少用户激活 / 权限被拒 /
+        // 系统不支持时会抛错，旧代码只弹一行报错就结束，用户看到的就是点了没动静。
+        console.log('\n[20] 文件夹模式：目录选择器失败后自动降级');
+
+        const pickerFailResult = await evaluate(pageCdp, `(async () => {
+            const makeFile = (relativePath, text) => {
+                const file = new File([text], relativePath.split('/').pop(), { type: 'text/vtt' });
+
+                Object.defineProperty(file, 'webkitRelativePath', { value: relativePath });
+
+                return file;
+            };
+
+            const originalPicker = window.showDirectoryPicker;
+            const input = document.getElementById('file-input-folder');
+            const originalClick = input.click;
+
+            // 模拟 picker 抛错；同时接管 input.click()：真实浏览器里这会打开系统目录选择器，
+            // 自动化环境里则直接替用户"选好"一个文件夹
+            window.showDirectoryPicker = async () => {
+                throw new DOMException('需要用户激活', 'SecurityError');
+            };
+
+            input.click = () => {
+                const transfer = new DataTransfer();
+
+                transfer.items.add(makeFile('作品/第一話.vtt', 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n降级第一句\\n'));
+                transfer.items.add(makeFile('作品/第二話.vtt', 'WEBVTT\\n\\n00:02.000 --> 00:04.000\\n降级第二句\\n'));
+
+                input.files = transfer.files;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+            };
+
+            try {
+                switchTab('folder');
+                await pickSourceFolder();
+
+                // change 处理器是异步的，等它把清单填好
+                for (let i = 0; i < 100 && filesToProcess.length === 0; i++) {
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                }
+
+                const job = createJob();
+                const { output } = await runEntriesInZip(job);
+                const names = Object.keys(output.files).filter(name => !output.files[name].dir).sort();
+
+                return {
+                    status: document.getElementById('status-message').textContent,
+                    folderStatus: document.getElementById('folder-status').textContent,
+                    hintIsWarning: document.getElementById('folder-status').className.includes('amber'),
+                    buttonLabel: document.getElementById('btn-text').textContent,
+                    count: filesToProcess.length,
+                    writable: job.directoryWritable,
+                    names
+                };
+            } finally {
+                window.showDirectoryPicker = originalPicker;
+                input.click = originalClick;
+            }
+        })()`);
+
+        check('目录选择器失败后自动降级为只读读入', pickerFailResult.count === 2, JSON.stringify(pickerFailResult));
+        check('并且说明了失败原因与降级结果', (pickerFailResult.folderStatus || '').includes('SecurityError') && (pickerFailResult.folderStatus || '').includes('打包成 ZIP 下载') && pickerFailResult.hintIsWarning === true, pickerFailResult.folderStatus);
+        check('降级后按钮文案变成打包下载', pickerFailResult.buttonLabel === '转换并下载 ZIP', pickerFailResult.buttonLabel);
+        check('降级后仍能正常转换', sameSet(pickerFailResult.names, ['第一話.lrc', '第二話.lrc']), JSON.stringify(pickerFailResult.names));
+
+        // --- 21. 文件夹模式：<input webkitdirectory> 的路径还原 ---
+        console.log('\n[21] 文件夹模式：webkitdirectory 的目录层级还原');
 
         const degradeResult = await evaluate(pageCdp, `(async () => {
             const makeFile = (relativePath, text) => {
