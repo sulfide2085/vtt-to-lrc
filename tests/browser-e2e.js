@@ -643,6 +643,7 @@ async function main() {
                 link.getAttribute('target') === '_blank' &&
                 link.textContent.includes('vtt-to-lrc');
         })()`));
+        check('页脚版本号与当前发布版一致（v1.9.0）', await evaluate(pageCdp, `document.querySelector('footer').textContent.includes('v1.9.0')`));
 
         // --- 2. ZIP 模式：真实点击 + 真实下载，并把下载到的压缩包拆开检查 ---
         console.log('\n[2] ZIP 模式（真实点击 + 真实下载，解包校验内容）');
