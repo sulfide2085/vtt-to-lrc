@@ -15,6 +15,8 @@
 - **文件保留**：ZIP 模式下自动保留非 VTT 文件（如 MP3、图片）
 - **智能命名**：自动处理 `文件名.mp3.vtt` 等复合后缀；`歌曲.wav` + `歌曲.wav.vtt` 会输出同名的 `歌曲.mp3` 与 `歌曲.lrc`
 - **兼容 Windows 压缩包**：资源管理器 / `Compress-Archive` 用反斜杠记录路径，读取时会自动修正
+- **RJ 号自动补全**（可选，需自建中转 Worker）：压缩包名里带 `RJxxxxxx` 时自动查 DLsite，
+  取回作品标题、社团、声优、封面，自动选好封面并写进 ID3（`TALB` 专辑 / `TPE1` 声优 / `TPE2` 社团 / `TCON` 流派 / `TYER` 年份）
 
 ## 使用方式
 
@@ -51,13 +53,36 @@ python -m http.server 8080
 | 单个文件出错 | 坏掉的 WAV 会原样保留在输出包里，其余文件继续转码，并在页面底部给出警告 |
 | 速度 | 约 6–10 倍实时（44.1 kHz 立体声 320 kbps 每分钟约 9 秒），转码时显示进度条 |
 
+## RJ 号自动补全标题与封面（可选）
+
+压缩包（或包内路径）里带 `RJ344794` 这样的编号时，工具可以自动查回 DLsite 的作品信息。
+
+**为什么需要一个 Worker**：实测 DLsite 的 `product.json` 接口虽然能用、也不需要 key，
+但**不返回任何 CORS 头**（带 `Origin` 请求也一样），浏览器直连必被拦；
+而封面 CDN `img.dlsite.jp` 返回 `Access-Control-Allow-Origin: *`，图片可以直接抓。
+所以只需要一个几百字节的元数据中转，封面不经过它。
+
+部署方法见 [`worker/README.md`](worker/README.md)，约 2 分钟：
+
+```bash
+cd worker
+npx wrangler login
+npx wrangler deploy
+```
+
+然后把打印出来的地址填到 `app.js` 的 `RJ_METADATA_ENDPOINT`。
+
+没配置也能正常用：页面会提示"识别到 RJ 号但未配置元数据服务"，封面照旧手动选择。
+
 ## 文件结构
 
 ```
-index.html              — 页面结构
-styles.css              — 样式
-app.js                  — 界面交互、VTT→LRC、ID3 封面写入、ZIP 打包
-audio.js                — WAV 解析 / 重采样 / MP3 编码核心（不依赖 DOM）
+index.html               — 页面结构
+styles.css               — 样式
+app.js                   — 界面交互、VTT→LRC、ID3 标签写入、ZIP 打包、RJ 查询联动
+audio.js                 — WAV 解析 / 重采样 / MP3 编码核心（不依赖 DOM）
+worker/dlsite-rj.js      — Cloudflare Worker：DLsite 元数据中转（带 24 小时缓存）
+worker/wrangler.toml     — Worker 部署配置
 tests/wav-to-mp3.test.js — 转码核心单元测试（零依赖）
 tests/browser-e2e.js     — 真实浏览器端到端测试（需要本机 Chrome/Edge）
 ```
@@ -66,7 +91,7 @@ tests/browser-e2e.js     — 真实浏览器端到端测试（需要本机 Chrom
 
 ```bash
 node tests/wav-to-mp3.test.js   # 19 项：解析、位深、重采样、码率收敛、MP3 帧头
-node tests/browser-e2e.js       # 58 项：真实 Chrome 驱动页面，含真实下载解包、ID3 封面、中途切标签、Windows 压缩包与窄屏点击
+node tests/browser-e2e.js       # 73 项：真实 Chrome 驱动页面，含真实下载解包、ID3 标签、RJ 联动（mock）、中途切标签、窄屏点击
 
 # 也可以直接测线上站点（部署后冒烟验证）
 node tests/browser-e2e.js https://sulfide2085.github.io/vtt-to-lrc/

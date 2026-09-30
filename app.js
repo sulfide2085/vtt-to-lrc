@@ -24,6 +24,12 @@ const lameStatus = document.getElementById('lame-status');
 const progressContainer = document.getElementById('progress-container');
 const progressBar = document.getElementById('progress-bar');
 const progressText = document.getElementById('progress-text');
+const workInfo = document.getElementById('work-info');
+const workCover = document.getElementById('work-cover');
+const workTitle = document.getElementById('work-title');
+const workMeta = document.getElementById('work-meta');
+const workLink = document.getElementById('work-link');
+const workStatus = document.getElementById('work-status');
 
 // 状态
 let filesToProcess = []; // 统一存储待处理文件 { name, getContent }
@@ -35,6 +41,17 @@ let currentTab = 'direct'; // direct | zip
 let zipHasMp3 = false; // 包内是否有 MP3（用于文件列表提示）
 let zipWavCount = 0; // 包内 WAV 数量
 let isProcessing = false; // 正在转换中：禁止切标签/清空/换文件，避免打断正在跑的任务
+let currentWork = null; // 按 RJ 号查到的作品信息
+
+/**
+ * RJ 元数据服务地址（Cloudflare Worker，部署方法见 worker/README.md）。
+ * 留空则不做自动查询，封面照旧手动选。
+ * 之所以要中转：DLsite 的 product.json 接口不带 CORS 头，浏览器直连必被拦；
+ * 而封面 CDN（img.dlsite.jp）返回 Access-Control-Allow-Origin: *，图片可以直接抓。
+ */
+let RJ_METADATA_ENDPOINT = '';
+
+const RJ_LOOKUP_TIMEOUT = 20000;
 
 // 固定 320 kbps：WAV 是无损 PCM，等效码率（CD 音质约 1411 kbps）远高于 320，
 // 没有"源码率"可继承，所以一律按 320 kbps 编码；只有采样率过低时
@@ -256,6 +273,9 @@ function clearFiles() {
     selectedCoverImage = null;
     zipHasMp3 = false;
     zipWavCount = 0;
+    currentWork = null;
+
+    hideWorkInfo();
 
     imagePreviewGrid.innerHTML = '';
     imagePreviewContainer.classList.add('hidden');
@@ -382,10 +402,165 @@ async function handleZipFile(zipFile) {
 
         updateFileListUI(hasMp3, wavCount);
         await extractAndDisplayImages();
+        await lookupWorkByRj();
     } catch (error) {
         console.error('解压文件时出错:', error);
         showStatusMessage('无法读取此 ZIP 文件，可能已损坏。');
         loadedZip = null;
+    }
+}
+
+// --- 作品信息（RJ 号自动查询）---
+
+/** 从任意字符串里找出 RJ 号，形如 RJ344794 或 RJ01014447 */
+function findRjCodeIn(text) {
+    const match = String(text || '').match(/RJ\s*(\d{6,8})/i);
+
+    return match ? `RJ${match[1]}` : null;
+}
+
+/** 先在压缩包文件名里找 RJ 号，再退回到包内路径里找 */
+function detectRjCode() {
+    const fromZipName = findRjCodeIn(originalInputName);
+
+    if (fromZipName) return fromZipName;
+
+    if (!loadedZip) return null;
+
+    for (const filename in loadedZip.files) {
+        const found = findRjCodeIn(filename);
+
+        if (found) return found;
+    }
+
+    return null;
+}
+
+function hideWorkInfo() {
+    workInfo.classList.add('hidden');
+    workCover.classList.add('hidden');
+    workCover.removeAttribute('src');
+    workTitle.textContent = '';
+    workMeta.textContent = '';
+    workStatus.textContent = '';
+    workLink.classList.add('hidden');
+}
+
+function showWorkStatus(text) {
+    workInfo.classList.remove('hidden');
+    workStatus.textContent = text;
+}
+
+async function lookupWorkMetadata(rj) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), RJ_LOOKUP_TIMEOUT);
+
+    try {
+        const response = await fetch(`${RJ_METADATA_ENDPOINT}/?rj=${encodeURIComponent(rj)}`, {
+            signal: controller.signal
+        });
+
+        let data = null;
+
+        try {
+            data = await response.json();
+        } catch {
+            throw new Error(`元数据服务返回了非 JSON 内容（HTTP ${response.status}）`);
+        }
+
+        if (!response.ok || !data || !data.ok) {
+            throw new Error((data && data.error) || `HTTP ${response.status}`);
+        }
+
+        return data;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** 抓到封面图后塞进预览网格，并在用户还没选封面时自动选中 */
+async function applyWorkCover(meta) {
+    if (!meta.coverUrl) return false;
+
+    const response = await fetch(meta.coverUrl);
+
+    if (!response.ok) throw new Error(`封面下载失败（HTTP ${response.status}）`);
+
+    const blob = await response.blob();
+    const image = {
+        name: `${meta.rj || 'dlsite'}-封面.jpg`,
+        mime: blob.type || 'image/jpeg',
+        base64: await blobToBase64(blob),
+        fromDlsite: true
+    };
+
+    zipImages = [image].concat(zipImages.filter(item => !item.fromDlsite));
+    renderImageGrid();
+
+    // 用户手动选过封面就别抢
+    if (!selectedCoverImage) {
+        selectCoverImage(0);
+    }
+
+    workCover.src = `data:${image.mime};base64,${image.base64}`;
+    workCover.classList.remove('hidden');
+
+    return true;
+}
+
+function renderWorkInfo(meta) {
+    workInfo.classList.remove('hidden');
+    workTitle.textContent = meta.title || '(无标题)';
+
+    const parts = [];
+
+    if (meta.circle) parts.push(meta.circle);
+    if (meta.voiceBy && meta.voiceBy.length) parts.push(`声优：${meta.voiceBy.join('、')}`);
+    if (meta.workType) parts.push(meta.workType);
+    if (meta.releaseDate) parts.push(meta.releaseDate);
+    if (meta.genres && meta.genres.length) parts.push(meta.genres.slice(0, 4).join(' / '));
+
+    workMeta.textContent = parts.join(' · ');
+
+    if (meta.pageUrl) {
+        workLink.href = meta.pageUrl;
+        workLink.classList.remove('hidden');
+    }
+}
+
+/** 上传压缩包后自动跑一遍：识别 RJ → 查作品 → 抓封面 */
+async function lookupWorkByRj() {
+    currentWork = null;
+
+    const rj = detectRjCode();
+
+    if (!rj) {
+        hideWorkInfo();
+        return;
+    }
+
+    if (!RJ_METADATA_ENDPOINT) {
+        showWorkStatus(`识别到 ${rj}，但还没配置 RJ 元数据服务（部署方法见 worker/README.md），封面请手动选择。`);
+        return;
+    }
+
+    showWorkStatus(`正在查询 ${rj} 的作品信息…`);
+
+    try {
+        const meta = await lookupWorkMetadata(rj);
+
+        currentWork = meta;
+        renderWorkInfo(meta);
+
+        try {
+            await applyWorkCover(meta);
+            workStatus.textContent = `${meta.rj} · 已自动选好封面，可在下方预览里改选`;
+        } catch (error) {
+            workStatus.textContent = `${meta.rj} · 作品信息已获取，但封面下载失败：${error.message}`;
+        }
+    } catch (error) {
+        currentWork = null;
+        showWorkStatus(`查询 ${rj} 失败：${error.message}（不影响使用，封面可手动选择）`);
     }
 }
 
@@ -846,8 +1021,12 @@ function parseId3v2(bytes) {
     };
 }
 
-function removeApicFramesFromId3v23(frameData) {
-    const keptFrames = [];
+/**
+ * 拆出 ID3v2.3 的各个帧，返回 { id, bytes } 列表。
+ * 遇到 padding 或长度不合法就停止（后面的内容当填充忽略）。
+ */
+function parseId3v23Frames(frameData) {
+    const frames = [];
     let offset = 0;
 
     while (offset + 10 <= frameData.length) {
@@ -870,14 +1049,15 @@ function removeApicFramesFromId3v23(frameData) {
             break;
         }
 
-        if (frameId !== 'APIC') {
-            keptFrames.push(frameData.slice(offset, offset + frameTotalSize));
-        }
+        frames.push({
+            id: frameId,
+            bytes: frameData.slice(offset, offset + frameTotalSize)
+        });
 
         offset += frameTotalSize;
     }
 
-    return concatUint8Arrays(keptFrames);
+    return frames;
 }
 
 function createTextFrameV23(frameId, text) {
@@ -888,6 +1068,27 @@ function createTextFrameV23(frameId, text) {
     frameContent.set(textBytes, 1);
 
     return createFrameV23(frameId, frameContent);
+}
+
+/**
+ * 把作品信息整理成 ID3v2.3 文本帧。
+ * TIT2=曲名  TALB=专辑（作品名）  TPE1=艺术家（声优）  TPE2=专辑艺术家（社团）
+ * TCON=流派  TYER=年份（v2.3 用 TYER，不是 v2.4 的 TDRC）
+ */
+function buildTextFramesV23(metadata) {
+    const pairs = [
+        ['TIT2', metadata.title],
+        ['TALB', metadata.album],
+        ['TPE1', metadata.artist],
+        ['TPE2', metadata.albumArtist],
+        ['TCON', metadata.genre],
+        ['TYER', metadata.year]
+    ].filter(([, value]) => value);
+
+    return pairs.map(([frameId, value]) => ({
+        id: frameId,
+        bytes: createTextFrameV23(frameId, value)
+    }));
 }
 
 function createApicFrameV23(imageBytes, imageMime) {
@@ -975,7 +1176,7 @@ function base64ToUint8Array(base64) {
 // --- ID3v2 封面写入 ---
 // 重点改进：
 // 1. 写入前把封面压缩成 800x800 JPEG
-// 2. 对 ID3v2.3 文件尽量保留原标签，只替换 APIC
+// 2. 对 ID3v2.3 文件尽量保留原标签，只替换 APIC，缺失的文本帧再补上
 // 3. 非 ID3v2.3 或无标签时，写入一个新的 ID3v2.3 标签
 
 async function addId3v2Cover(mp3ArrayBuffer, imageBase64, imageMime, metadata = {}) {
@@ -990,28 +1191,24 @@ async function addId3v2Cover(mp3ArrayBuffer, imageBase64, imageMime, metadata = 
     const audioBytes = mp3Bytes.slice(parsed.audioStart);
 
     const apicFrame = createApicFrameV23(imageBytes, normalizedCover.mime);
-
-    let frames = [];
+    const textFrames = buildTextFramesV23(metadata);
+    const frames = [];
 
     if (parsed.hasTag && parsed.majorVersion === 3) {
-        // 保留原 ID3v2.3 的非 APIC 帧，只替换封面
-        const keptFrameData = removeApicFramesFromId3v23(parsed.frameData);
+        // 保留原 ID3v2.3 的非 APIC 帧，只替换封面；
+        // 原标签里没有的文本帧（专辑/艺术家等）补进去，已有的不动
+        const keptFrames = parseId3v23Frames(parsed.frameData).filter(frame => frame.id !== 'APIC');
+        const existingIds = new Set(keptFrames.map(frame => frame.id));
 
-        frames.push(keptFrameData);
-
-        // 如原标签里完全缺少基础信息，可按文件名补一个标题
-        if (metadata.title) {
-            // 为了避免重复 TIT2，这里不强行补写。
-            // 需要强制补标题时，可以在这里添加 createTextFrameV23('TIT2', metadata.title)
-        }
+        keptFrames.forEach(frame => frames.push(frame.bytes));
+        textFrames
+            .filter(frame => !existingIds.has(frame.id))
+            .forEach(frame => frames.push(frame.bytes));
 
         frames.push(apicFrame);
     } else {
         // 没有 ID3v2 标签，或版本不是 v2.3：新建一个兼容性较好的 ID3v2.3 标签
-        if (metadata.title) {
-            frames.push(createTextFrameV23('TIT2', metadata.title));
-        }
-
+        textFrames.forEach(frame => frames.push(frame.bytes));
         frames.push(apicFrame);
     }
 
@@ -1126,6 +1323,7 @@ function createJob() {
         files: filesToProcess,
         zipName: originalInputName,
         coverImage: selectedCoverImage, // 封面快照，最关键的一项
+        work: currentWork, // 作品信息快照（用于写 ID3 的专辑/艺术家）
         shouldFlatten: flattenCheckbox.checked,
         shouldTranscodeWav: transcodeWavCheckbox.checked,
         bitrate: MP3_BITRATE
@@ -1194,6 +1392,21 @@ function uniqueOutputName(candidate, takenNames) {
     takenNames.add(name);
 
     return name;
+}
+
+/** 用作品信息补全 ID3 的专辑/艺术家等字段（查不到作品时留空） */
+function buildTrackMetadata(work, trackTitle) {
+    const metadata = { title: trackTitle };
+
+    if (!work) return metadata;
+
+    metadata.album = work.title || '';
+    metadata.artist = (work.voiceBy && work.voiceBy.length ? work.voiceBy.join('、') : '') || work.circle || '';
+    metadata.albumArtist = work.circle || '';
+    metadata.genre = work.genres && work.genres.length ? work.genres.slice(0, 3).join('/') : '';
+    metadata.year = (work.releaseDate || '').slice(0, 4);
+
+    return metadata;
 }
 
 async function processZipMode(outputZip, job) {
@@ -1271,9 +1484,7 @@ async function processZipMode(outputZip, job) {
                         outputBuffer,
                         coverImage.base64,
                         coverImage.mime,
-                        {
-                            title: getBaseName(filename).replace(/\.[^.]+$/, '')
-                        }
+                        buildTrackMetadata(job.work, getBaseName(filename).replace(/\.[^.]+$/, ''))
                     );
                 }
 
@@ -1296,15 +1507,11 @@ async function processZipMode(outputZip, job) {
         if (isMp3File(filename) && coverImage) {
             const arrayBuffer = await zipEntry.async('arraybuffer');
 
-            const metadata = {
-                title: getBaseName(newName).replace(/\.[^.]+$/, '')
-            };
-
             const taggedBuffer = await addId3v2Cover(
                 arrayBuffer,
                 coverImage.base64,
                 coverImage.mime,
-                metadata
+                buildTrackMetadata(job.work, getBaseName(newName).replace(/\.[^.]+$/, ''))
             );
 
             outputZip.file(

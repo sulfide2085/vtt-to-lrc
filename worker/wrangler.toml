@@ -1,0 +1,6 @@
+name = "vtt-lrc-rj"
+main = "dlsite-rj.js"
+compatibility_date = "2025-06-01"
+
+# 这个 Worker 不需要任何绑定（KV / D1 / R2），缓存用的是 Cloudflare 自带的 Cache API。
+# 免费套餐每天 10 万次请求，个人使用绰绰有余。

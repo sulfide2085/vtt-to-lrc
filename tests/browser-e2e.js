@@ -874,10 +874,168 @@ async function main() {
             );
         }
 
-        // --- 11. 窄屏下标签都要能被真实鼠标点到 ---
+        // --- 11. RJ 号 → 作品标题 / 封面 自动联动（用 mock 服务，不需要真部署 Worker）---
+        console.log('\n[11] RJ 号自动查标题与封面');
+
+        const rjResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+
+            const indexOfBytes = (haystack, needle) => {
+                outer: for (let i = 0; i + needle.length <= haystack.length; i++) {
+                    for (let j = 0; j < needle.length; j++) {
+                        if (haystack[i + j] !== needle[j]) continue outer;
+                    }
+                    return i;
+                }
+                return -1;
+            };
+            const ascii = text => Array.from(text).map(char => char.charCodeAt(0));
+
+            // 造一张真 JPEG 当 DLsite 封面，挂成 blob URL 供 mock fetch 返回
+            const canvas = document.createElement('canvas');
+            canvas.width = 560;
+            canvas.height = 420;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#123456';
+            ctx.fillRect(0, 0, 560, 420);
+            const coverBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+            const coverBlobUrl = URL.createObjectURL(coverBlob);
+
+            const originalFetch = window.fetch;
+            const fetched = [];
+
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                fetched.push(url);
+
+                if (url.includes('mock-rj.test')) {
+                    return Promise.resolve(new Response(JSON.stringify({
+                        ok: true,
+                        rj: 'RJ344794',
+                        title: '絶対にテスト用の作品タイトル',
+                        circle: 'テストサークル',
+                        voiceBy: ['分倍河原シホ'],
+                        genres: ['音声', 'ASMR'],
+                        workType: 'ボイス・ASMR',
+                        releaseDate: '2022-05-13',
+                        coverUrl: coverBlobUrl,
+                        pageUrl: 'https://www.dlsite.com/maniax/work/=/product_id/RJ344794.html'
+                    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+                }
+
+                return originalFetch(input, init);
+            };
+
+            RJ_METADATA_ENDPOINT = 'https://mock-rj.test';
+
+            const source = new JSZip();
+            source.file('RJ344794 测试作品/1.トラック.wav', makeTestWav({ frames: 22050 }));
+            source.file('RJ344794 测试作品/1.トラック.wav.vtt', 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n台词\\n');
+
+            const blob = await source.generateAsync({ type: 'blob' });
+
+            switchTab('zip');
+            document.getElementById('transcode-wav-checkbox').checked = true;
+
+            // 压缩包文件名带 RJ 号，handleZipFile 内部会自动查询
+            await handleZipFile(new File([blob], 'RJ344794 口淫担当女仆.zip', { type: 'application/zip' }));
+
+            const uiState = {
+                infoVisible: !document.getElementById('work-info').classList.contains('hidden'),
+                title: document.getElementById('work-title').textContent,
+                meta: document.getElementById('work-meta').textContent,
+                link: document.getElementById('work-link').getAttribute('href'),
+                coverVisible: !document.getElementById('work-cover').classList.contains('hidden'),
+                coverSelected: !!selectedCoverImage,
+                coverIsDlsite: !!(selectedCoverImage && selectedCoverImage.name.includes('RJ344794')),
+                thumbCount: document.querySelectorAll('#image-preview-grid .image-thumb-wrapper').length,
+                lookupCalled: fetched.some(url => url.includes('mock-rj.test'))
+            };
+
+            const output = new JSZip();
+            await processZipMode(output, createJob());
+
+            const mp3Name = Object.keys(output.files).find(name => name.endsWith('.mp3'));
+            const bytes = mp3Name ? await output.file(mp3Name).async('uint8array') : new Uint8Array(0);
+            const headerText = new TextDecoder('utf-8').decode(bytes.slice(0, 3000));
+
+            URL.revokeObjectURL(coverBlobUrl);
+            window.fetch = originalFetch;
+
+            return Object.assign(uiState, {
+                mp3Name,
+                hasApic: indexOfBytes(bytes, ascii('APIC')) >= 0,
+                hasTalb: indexOfBytes(bytes, ascii('TALB')) >= 0,
+                hasTpe1: indexOfBytes(bytes, ascii('TPE1')) >= 0,
+                hasTit2: indexOfBytes(bytes, ascii('TIT2')) >= 0,
+                headerText
+            });
+        })()`);
+
+        check('压缩包文件名里的 RJ 号被识别并发起查询', rjResult.lookupCalled === true);
+        check('作品信息面板显示出来', rjResult.infoVisible === true);
+        check('标题取自 DLsite 元数据', rjResult.title === '絶対にテスト用の作品タイトル', rjResult.title);
+        check('元信息含社团与声优', rjResult.meta.includes('テストサークル') && rjResult.meta.includes('分倍河原シホ'), rjResult.meta);
+        check('DLsite 链接正确', (rjResult.link || '').includes('RJ344794'), String(rjResult.link));
+        check('封面缩略图已加入预览并自动选中', rjResult.thumbCount >= 1 && rjResult.coverSelected === true && rjResult.coverIsDlsite === true);
+        check('MP3 里有 APIC 封面帧', rjResult.hasApic === true);
+        check('MP3 里有专辑帧 TALB（作品名）', rjResult.hasTalb === true && rjResult.headerText.includes('絶対にテスト用の作品タイトル'), '未找到 TALB 或标题');
+        check('MP3 里有艺术家帧 TPE1（声优）', rjResult.hasTpe1 === true && rjResult.headerText.includes('分倍河原シホ'), '未找到 TPE1 或声优名');
+        check('MP3 里保留曲名帧 TIT2', rjResult.hasTit2 === true && rjResult.headerText.includes('1.トラック'), '未找到 TIT2');
+
+        // --- 12. 元数据服务不可用时不能拖垮流程 ---
+        console.log('\n[12] RJ 查询失败时仍能正常转换');
+
+        const rjFailResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+
+            const originalFetch = window.fetch;
+
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+
+                if (url.includes('mock-fail.test')) {
+                    return Promise.resolve(new Response(JSON.stringify({ ok: false, error: 'DLsite 返回 HTTP 429（可能是限流，稍后再试）' }), {
+                        status: 502,
+                        headers: { 'Content-Type': 'application/json' }
+                    }));
+                }
+
+                return originalFetch(input, init);
+            };
+
+            RJ_METADATA_ENDPOINT = 'https://mock-fail.test';
+
+            const source = new JSZip();
+            source.file('RJ999999 无服务/1.曲.wav', makeTestWav({ frames: 11025 }));
+
+            const blob = await source.generateAsync({ type: 'blob' });
+
+            switchTab('zip');
+            document.getElementById('transcode-wav-checkbox').checked = true;
+            await handleZipFile(new File([blob], 'RJ999999 测试.zip', { type: 'application/zip' }));
+
+            const status = document.getElementById('work-status').textContent;
+            const output = new JSZip();
+            const result = await processZipMode(output, createJob());
+
+            window.fetch = originalFetch;
+
+            return {
+                status,
+                names: Object.keys(output.files).filter(name => !output.files[name].dir),
+                warnings: result.warnings
+            };
+        })()`);
+
+        check('界面给出查询失败提示', rjFailResult.status.includes('查询') && rjFailResult.status.includes('失败'), rjFailResult.status);
+        check('提示里带上服务返回的错误', rjFailResult.status.includes('429'), rjFailResult.status);
+        check('查询失败不影响转码出 MP3', rjFailResult.names.some(name => name.endsWith('.mp3')), JSON.stringify(rjFailResult.names));
+
+        // --- 13. 窄屏下标签都要能被真实鼠标点到 ---
         // 只点 element.click() 会掩盖"被 overflow-hidden 裁掉"这类问题，
         // 所以这里缩到 320px 宽并用 CDP 派发真实鼠标事件。
-        console.log('\n[11] 窄屏 320px 下用真实鼠标点击标签页');
+        console.log('\n[13] 窄屏 320px 下用真实鼠标点击标签页');
 
         await pageCdp.send('Emulation.setDeviceMetricsOverride', {
             width: 320,
@@ -927,10 +1085,10 @@ async function main() {
             await evaluate(pageCdp, '!document.getElementById("zip-options").classList.contains("hidden")')
         );
 
-        // --- 12. 访问统计（GoatCounter）只在线上真的生效 ---
+        // --- 14. 访问统计（GoatCounter）只在线上真的生效 ---
         // 线上必须发出 /count 请求，否则统计数据会静默丢失；
         // 本地 file:// 则必须不发，避免开发时污染线上数据。
-        console.log('\n[12] 访问统计（GoatCounter）');
+        console.log('\n[14] 访问统计（GoatCounter）');
 
         await pageCdp.send('Network.enable');
 

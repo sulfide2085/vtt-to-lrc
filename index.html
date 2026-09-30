@@ -70,6 +70,20 @@
                     <p id="lame-status" class="text-xs text-gray-400"></p>
                 </div>
 
+                <!-- 作品信息（按 RJ 号自动查询，见 worker/README.md） -->
+                <div id="work-info" class="mt-6 hidden">
+                    <h2 class="text-lg font-semibold text-gray-700 mb-2">作品信息</h2>
+                    <div class="flex gap-4 items-start bg-gray-50 rounded-xl p-4">
+                        <img id="work-cover" alt="" class="w-20 h-20 shrink-0 rounded-lg object-cover bg-gray-200 hidden">
+                        <div class="min-w-0 text-sm">
+                            <div id="work-title" class="font-medium text-gray-800 break-words"></div>
+                            <div id="work-meta" class="text-gray-500 mt-1 break-words"></div>
+                            <a id="work-link" href="#" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline text-xs mt-1 inline-block hidden">在 DLsite 查看</a>
+                        </div>
+                    </div>
+                    <p id="work-status" class="text-xs text-gray-400 mt-2"></p>
+                </div>
+
                 <!-- 文件列表 -->
                 <div id="file-list-container" class="mt-8 hidden">
                     <h2 id="file-list-title" class="text-lg font-semibold text-gray-700 mb-2">待处理 VTT 文件</h2>
@@ -111,7 +125,7 @@
                     <span>GitHub · sulfide2085/vtt-to-lrc</span>
                 </a>
             </div>
-            <div>v1.6.0</div>
+            <div>v1.7.0</div>
         </footer>
     </div>
 
