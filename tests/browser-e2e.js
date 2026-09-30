@@ -2295,10 +2295,204 @@ async function main() {
             check('真实句柄上搬动不产生虚假失败', !(opfsFlatten.status || '').includes('失败'), opfsFlatten.status);
         }
 
-        // --- 27. 访问统计（GoatCounter）只在线上真的生效 ---
+        // --- 27. 封面裁切：非 1:1 的图可以自己框选区域 ---
+        // 用"左半红、右半蓝"的 2:1 图当封面：居中裁切必然红蓝各半，
+        // 把框拖到最左边则应该整块都是红的——这样能证明用户框的区域真的写进了 MP3。
+        console.log('\n[27] 封面裁切：非方图自己框选区域');
+
+        const cropResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+
+            async function sampleApic(mp3Bytes) {
+                const apic = findApicImageBytes(mp3Bytes);
+
+                if (!apic) return null;
+
+                const bitmap = await createImageBitmap(new Blob([apic], { type: 'image/jpeg' }));
+                const canvas = document.createElement('canvas');
+
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+
+                const ctx = canvas.getContext('2d');
+
+                ctx.drawImage(bitmap, 0, 0);
+
+                const at = (fx, fy) => {
+                    const data = ctx.getImageData(Math.round(bitmap.width * fx), Math.round(bitmap.height * fy), 1, 1).data;
+
+                    return [data[0], data[1], data[2]];
+                };
+
+                return { width: bitmap.width, height: bitmap.height, left: at(0.15, 0.5), right: at(0.85, 0.5) };
+            }
+
+            // 2:1 封面（1600×800，左半纯红、右半纯蓝）：既验证"超 800 会被缩到 800"，
+            // 也验证框选区域生效——居中裁切红蓝各半，框到最左则整块都是红的
+            const cover = document.createElement('canvas');
+            cover.width = 1600;
+            cover.height = 800;
+
+            const coverCtx = cover.getContext('2d');
+            coverCtx.fillStyle = '#ff0000';
+            coverCtx.fillRect(0, 0, 800, 800);
+            coverCtx.fillStyle = '#0000ff';
+            coverCtx.fillRect(800, 0, 800, 800);
+
+            const coverBytes = new Uint8Array(await (await new Promise(r => cover.toBlob(r, 'image/jpeg', 0.95))).arrayBuffer());
+
+            const source = new JSZip();
+            source.file('包/曲目.wav', makeTestWav({ frames: 22050 }));
+            source.file('包/封面.jpg', coverBytes);
+
+            const blob = await source.generateAsync({ type: 'blob' });
+
+            switchTab('zip');
+            document.getElementById('transcode-wav-checkbox').checked = true;
+            await handleZipFile(new File([blob], '裁切测试.zip', { type: 'application/zip' }));
+
+            // 选中封面（网格里只有这一张图）
+            document.querySelector('#image-preview-grid .image-thumb-wrapper').click();
+
+            // 等缩略图 load 事件把原始尺寸记下来
+            for (let i = 0; i < 50 && !document.getElementById('crop-hint').textContent; i++) {
+                await new Promise(r => setTimeout(r, 20));
+            }
+
+            const affordance = {
+                hintVisible: !document.getElementById('crop-hint').classList.contains('hidden'),
+                hintText: document.getElementById('crop-hint').textContent,
+                buttonVisible: !document.getElementById('crop-open-btn').classList.contains('hidden'),
+                buttonText: document.getElementById('crop-open-btn').textContent
+            };
+
+            // 对照组：没调裁切时是居中裁切，红蓝各半
+            const centerRun = await runEntriesInZip(createJob());
+            const centerMp3 = Object.keys(centerRun.output.files).find(name => name.endsWith('.mp3'));
+            const centerSample = await sampleApic(await centerRun.output.file(centerMp3).async('uint8array'));
+
+            // 打开裁切器
+            document.getElementById('crop-open-btn').click();
+
+            for (let i = 0; i < 100 && document.getElementById('crop-modal').classList.contains('hidden'); i++) {
+                await new Promise(r => setTimeout(r, 20));
+            }
+
+            await new Promise(r => setTimeout(r, 150));
+
+            const viewport = document.getElementById('crop-viewport');
+            const viewportRect = viewport.getBoundingClientRect();
+            const centerX = viewportRect.left + viewportRect.width / 2;
+            const centerY = viewportRect.top + viewportRect.height / 2;
+
+            const opened = {
+                modalVisible: !document.getElementById('crop-modal').classList.contains('hidden'),
+                sizeLabel: document.getElementById('crop-size-label').textContent,
+                zoomValue: document.getElementById('crop-zoom').value,
+                imageWidth: document.getElementById('crop-image').getBoundingClientRect().width
+            };
+
+            // 拖动：把图片使劲往右拖 → 方框落到原图最左边那块
+            viewport.dispatchEvent(new PointerEvent('pointerdown', { pointerId: 7, clientX: centerX, clientY: centerY, bubbles: true }));
+            viewport.dispatchEvent(new PointerEvent('pointermove', { pointerId: 7, clientX: centerX + 600, clientY: centerY, bubbles: true }));
+            viewport.dispatchEvent(new PointerEvent('pointerup', { pointerId: 7, clientX: centerX + 600, clientY: centerY, bubbles: true }));
+
+            const afterDragLabel = document.getElementById('crop-size-label').textContent;
+
+            // 缩放：滑到 200%
+            const zoom = document.getElementById('crop-zoom');
+            zoom.value = '200';
+            zoom.dispatchEvent(new Event('input', { bubbles: true }));
+
+            const afterZoomLabel = document.getElementById('crop-size-label').textContent;
+
+            // 复位：回到居中
+            document.getElementById('crop-reset').click();
+            const afterResetLabel = document.getElementById('crop-size-label').textContent;
+
+            // 再拖到最左并确认
+            viewport.dispatchEvent(new PointerEvent('pointerdown', { pointerId: 8, clientX: centerX, clientY: centerY, bubbles: true }));
+            viewport.dispatchEvent(new PointerEvent('pointermove', { pointerId: 8, clientX: centerX + 600, clientY: centerY, bubbles: true }));
+            viewport.dispatchEvent(new PointerEvent('pointerup', { pointerId: 8, clientX: centerX + 600, clientY: centerY, bubbles: true }));
+
+            document.getElementById('crop-confirm').click();
+
+            const storedCrop = selectedCoverImage.crop;
+            const hintAfter = document.getElementById('crop-hint').textContent;
+            const buttonAfter = document.getElementById('crop-open-btn').textContent;
+
+            // 再用同一个 job 转一次，检查写进去的封面
+            const cropRun = await runEntriesInZip(createJob());
+            const cropMp3 = Object.keys(cropRun.output.files).find(name => name.endsWith('.mp3'));
+            const cropSample = await sampleApic(await cropRun.output.file(cropMp3).async('uint8array'));
+
+            // 重开裁切器：应该还原成刚才框的位置（尺寸不变）
+            document.getElementById('crop-open-btn').click();
+
+            for (let i = 0; i < 100 && document.getElementById('crop-modal').classList.contains('hidden'); i++) {
+                await new Promise(r => setTimeout(r, 20));
+            }
+
+            await new Promise(r => setTimeout(r, 150));
+
+            const reopenedLabel = document.getElementById('crop-size-label').textContent;
+            const reopenedZoom = document.getElementById('crop-zoom').value;
+
+            // Esc 取消不该改动已保存的裁切
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+            return {
+                affordance,
+                centerSample,
+                opened,
+                afterDragLabel,
+                afterZoomLabel,
+                afterResetLabel,
+                storedCrop,
+                hintAfter,
+                buttonAfter,
+                cropSample,
+                reopenedLabel,
+                reopenedZoom,
+                modalClosedByEsc: document.getElementById('crop-modal').classList.contains('hidden'),
+                cropStillThere: JSON.stringify(selectedCoverImage.crop) === JSON.stringify(storedCrop)
+            };
+        })()`);
+
+        const isReddish = rgb => rgb && rgb[0] > 150 && rgb[1] < 90 && rgb[2] < 90;
+        const isBluish = rgb => rgb && rgb[2] > 150 && rgb[0] < 90 && rgb[1] < 90;
+
+        check('非方图会提示可以自己框选', cropResult.affordance.hintVisible === true && cropResult.affordance.hintText.includes('1600×800'), JSON.stringify(cropResult.affordance));
+        check('出现「调整封面裁切…」入口', cropResult.affordance.buttonVisible === true && cropResult.affordance.buttonText.includes('调整封面裁切'), JSON.stringify(cropResult.affordance));
+        check('裁切器能打开并显示尺寸信息', cropResult.opened.modalVisible === true && /裁切 800×800/.test(cropResult.opened.sizeLabel) && /写入封面 800×800/.test(cropResult.opened.sizeLabel), JSON.stringify(cropResult.opened));
+        check('默认居中的封面红蓝各占一半（对照组）', isReddish(cropResult.centerSample.left) && isBluish(cropResult.centerSample.right), JSON.stringify(cropResult.centerSample));
+        check('超 800 的封面会被缩到 800×800 的正方形', cropResult.centerSample.width === 800 && cropResult.centerSample.height === 800, JSON.stringify(cropResult.centerSample));
+        check('拖动后裁切区域贴着原图左边缘', /裁切 800×800/.test(cropResult.afterDragLabel), cropResult.afterDragLabel);
+        check('缩放 200% 后裁切区域缩小到 400×400', /裁切 400×400/.test(cropResult.afterZoomLabel), cropResult.afterZoomLabel);
+        check('「复位居中」恢复到 800×800', /裁切 800×800/.test(cropResult.afterResetLabel), cropResult.afterResetLabel);
+        check(
+            '确认后保存的裁切区域在原图范围内且贴左',
+            cropResult.storedCrop && cropResult.storedCrop.x === 0 && cropResult.storedCrop.y === 0 &&
+                cropResult.storedCrop.size === 800 &&
+                cropResult.storedCrop.x + cropResult.storedCrop.size <= 1600 &&
+                cropResult.storedCrop.y + cropResult.storedCrop.size <= 800,
+            JSON.stringify(cropResult.storedCrop)
+        );
+        check('选过裁切后提示改成"已自定义"', cropResult.hintAfter.includes('已自定义裁切区域'), cropResult.hintAfter);
+        check('入口改成「重新调整裁切…」', cropResult.buttonAfter.includes('重新调整'), cropResult.buttonAfter);
+        check(
+            'MP3 里的封面用的是用户框的左半边（整块都是红的）',
+            isReddish(cropResult.cropSample.left) && isReddish(cropResult.cropSample.right),
+            JSON.stringify(cropResult.cropSample)
+        );
+        check('裁切后的封面同样是 800×800', cropResult.cropSample.width === 800 && cropResult.cropSample.height === 800, JSON.stringify(cropResult.cropSample));
+        check('重开裁切器还原到已保存的区域', /裁切 800×800/.test(cropResult.reopenedLabel) && cropResult.reopenedZoom === '100', `${cropResult.reopenedLabel} / ${cropResult.reopenedZoom}`);
+        check('Esc 关闭裁切器且不改动已保存的裁切', cropResult.modalClosedByEsc === true && cropResult.cropStillThere === true, JSON.stringify({ closed: cropResult.modalClosedByEsc, kept: cropResult.cropStillThere }));
+
+        // --- 28. 访问统计（GoatCounter）只在线上真的生效 ---
         // 线上必须发出 /count 请求，否则统计数据会静默丢失；
         // 本地 file:// 则必须不发，避免开发时污染线上数据。
-        console.log('\n[27] 访问统计（GoatCounter）');
+        console.log('\n[28] 访问统计（GoatCounter）');
 
         await pageCdp.send('Network.enable');
 

@@ -118,6 +118,59 @@ body {
     overflow-wrap: anywhere;
 }
 .writeback-list li .writeback-size { color: #9CA3AF; }
+
+/* 封面裁切：方框固定，图片在里面拖动/缩放（头像那种交互） */
+.crop-stage {
+    position: relative;
+    margin-top: 1rem;
+    display: flex;
+    justify-content: center;
+}
+.crop-viewport {
+    position: relative;
+    width: min(288px, 72vw);
+    aspect-ratio: 1 / 1;
+    overflow: hidden;
+    border-radius: 0.75rem;
+    background: #111827;
+    cursor: grab;
+    touch-action: none; /* 触屏拖动时不要连带滚页面 */
+    user-select: none;
+}
+.crop-viewport.dragging { cursor: grabbing; }
+.crop-viewport img {
+    position: absolute;
+    top: 0;
+    left: 0;
+    max-width: none; /* 必须放开，否则 Tailwind 的 preflight 会把图压回容器宽 */
+    transform-origin: top left;
+    pointer-events: none; /* 拖动交给容器处理 */
+    -webkit-user-drag: none;
+}
+/* 三分线 + 外描边，帮用户对齐主体 */
+.crop-viewport::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border: 2px solid rgba(255, 255, 255, 0.9);
+    border-radius: 0.75rem;
+    box-shadow: inset 0 0 0 1px rgba(17, 24, 39, 0.35);
+    background-image:
+        linear-gradient(to right, rgba(255, 255, 255, 0.35) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(255, 255, 255, 0.35) 1px, transparent 1px);
+    background-size: 33.333% 33.333%;
+    background-position: 33.333% 33.333%;
+}
+.crop-busy {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    color: #6B7280;
+}
 .path-badge {
     display: inline-block;
     max-width: 100%;

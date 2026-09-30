@@ -10,7 +10,7 @@
         还在跑缓存里的旧 JS，会出现"代码明明修好了、用户还在报旧错误"的情况。
         改版本号时记得把这里和页脚一起改（端到端测试会校验两者一致）。
     -->
-    <link rel="stylesheet" href="styles.css?v=1.9.1">
+    <link rel="stylesheet" href="styles.css?v=1.10.0">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <!-- lamejs：LAME 的 JS 移植，用于把 WAV 转码成 320 kbps 的 MP3（主源失败时自动切备用源） -->
@@ -129,7 +129,11 @@
                 </div>
                 <!-- 图片预览 -->
                 <div id="image-preview-container" class="mt-6 hidden">
-                    <h2 id="image-preview-title" class="text-lg font-semibold text-gray-700 mb-2">图片预览 (点击选择封面)</h2>
+                    <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-2">
+                        <h2 id="image-preview-title" class="text-lg font-semibold text-gray-700">图片预览 (点击选择封面)</h2>
+                        <button type="button" id="crop-open-btn" class="hidden text-xs font-medium text-blue-600 hover:text-blue-700 underline underline-offset-2">调整封面裁切…</button>
+                    </div>
+                    <p id="crop-hint" class="text-xs text-amber-600 mb-2 hidden"></p>
                     <div id="image-preview-grid" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3 max-h-60 overflow-y-auto pr-2"></div>
                 </div>
 
@@ -163,7 +167,7 @@
                     <span>GitHub · sulfide2085/vtt-to-lrc</span>
                 </a>
             </div>
-            <div>v1.9.1</div>
+            <div>v1.10.0</div>
         </footer>
     </div>
 
@@ -187,9 +191,46 @@
         </div>
     </div>
 
-    <script src="audio.js?v=1.9.1"></script>
-    <script src="folder.js?v=1.9.1"></script>
-    <script src="app.js?v=1.9.1"></script>
+    <!--
+        封面裁切弹窗：非 1:1 的图默认居中裁切，用户想自己选区域时打开它。
+        做成头像那种交互——方框固定不动，拖图片平移、滑块缩放，框内即最终封面。
+    -->
+    <div id="crop-modal" class="modal-backdrop hidden">
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="crop-title">
+            <h2 id="crop-title" class="text-lg font-bold text-gray-800">调整封面裁切</h2>
+            <p class="text-sm text-gray-500 mt-1">拖动图片移动位置，用滑块缩放。<strong>方框内的部分</strong>就是封面，导出时会压成正方形 JPEG。</p>
+
+            <div class="crop-stage">
+                <div id="crop-viewport" class="crop-viewport" role="application" aria-label="封面裁切区域">
+                    <img id="crop-image" alt="" draggable="false">
+                </div>
+                <div id="crop-busy" class="crop-busy hidden">正在读取图片…</div>
+            </div>
+
+            <div class="mt-4 flex items-center gap-3">
+                <span class="text-xs text-gray-500 shrink-0">缩放</span>
+                <input type="range" id="crop-zoom" min="100" max="400" step="1" value="100" class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer" aria-label="封面缩放">
+                <span id="crop-zoom-label" class="text-xs text-gray-500 w-10 text-right shrink-0">100%</span>
+            </div>
+            <p id="crop-size-label" class="text-xs text-gray-400 mt-2"></p>
+
+            <div class="mt-5 flex flex-col sm:flex-row gap-3">
+                <button id="crop-confirm" type="button" class="w-full bg-blue-500 text-white font-bold py-3 px-4 rounded-xl shadow-md hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-all duration-200 btn">
+                    确定裁切
+                </button>
+                <button id="crop-reset" type="button" class="w-full sm:w-auto shrink-0 whitespace-nowrap bg-gray-100 text-gray-700 font-bold py-3 px-5 rounded-xl hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-400 transition-all duration-200 btn">
+                    复位居中
+                </button>
+                <button id="crop-cancel" type="button" class="w-full sm:w-auto shrink-0 whitespace-nowrap bg-gray-200 text-gray-700 font-bold py-3 px-5 rounded-xl hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-400 transition-all duration-200 btn">
+                    取消
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="audio.js?v=1.10.0"></script>
+    <script src="folder.js?v=1.10.0"></script>
+    <script src="app.js?v=1.10.0"></script>
 
     <!--
         访问统计：GoatCounter

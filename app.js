@@ -25,6 +25,18 @@ const flattenCheckbox = document.getElementById('flatten-checkbox');
 const imagePreviewContainer = document.getElementById('image-preview-container');
 const imagePreviewGrid = document.getElementById('image-preview-grid');
 const imagePreviewTitle = document.getElementById('image-preview-title');
+const cropOpenBtn = document.getElementById('crop-open-btn');
+const cropHint = document.getElementById('crop-hint');
+const cropModal = document.getElementById('crop-modal');
+const cropViewport = document.getElementById('crop-viewport');
+const cropImage = document.getElementById('crop-image');
+const cropBusy = document.getElementById('crop-busy');
+const cropZoom = document.getElementById('crop-zoom');
+const cropZoomLabel = document.getElementById('crop-zoom-label');
+const cropSizeLabel = document.getElementById('crop-size-label');
+const cropConfirmBtn = document.getElementById('crop-confirm');
+const cropResetBtn = document.getElementById('crop-reset');
+const cropCancelBtn = document.getElementById('crop-cancel');
 const transcodeWavCheckbox = document.getElementById('transcode-wav-checkbox');
 const lameStatus = document.getElementById('lame-status');
 const progressContainer = document.getElementById('progress-container');
@@ -154,8 +166,16 @@ writebackConfirm.addEventListener('click', () => resolveWritebackConfirm(true));
 writebackCancel.addEventListener('click', () => resolveWritebackConfirm(false));
 
 document.addEventListener('keydown', e => {
-    if (e.key === 'Escape' && !writebackModal.classList.contains('hidden')) {
+    if (e.key !== 'Escape') return;
+
+    if (!writebackModal.classList.contains('hidden')) {
         resolveWritebackConfirm(false);
+        return;
+    }
+
+    // 裁切弹窗：Esc 等于取消，不改动已保存的裁切区域
+    if (!cropModal.classList.contains('hidden')) {
+        closeCropEditor();
     }
 });
 
@@ -1212,6 +1232,8 @@ function renderImageGrid() {
 
     if (zipImages.length === 0) {
         imagePreviewContainer.classList.add('hidden');
+        cropOpenBtn.classList.add('hidden');
+        cropHint.classList.add('hidden');
         return;
     }
 
@@ -1225,6 +1247,16 @@ function renderImageGrid() {
         const image = document.createElement('img');
         image.src = `data:${img.mime};base64,${img.base64}`;
         image.alt = img.name;
+
+        // 记下原始尺寸：用来判断"要不要提示用户可以自己框选"（非 1:1 才提示）
+        image.addEventListener('load', () => {
+            if (!image.naturalWidth || !image.naturalHeight) return;
+
+            img.width = image.naturalWidth;
+            img.height = image.naturalHeight;
+
+            updateCropAffordance();
+        });
 
         const check = document.createElement('div');
         check.className = 'cover-check';
@@ -1247,6 +1279,7 @@ function renderImageGrid() {
         : '图片预览 (点击选择封面)';
 
     imagePreviewContainer.classList.remove('hidden');
+    updateCropAffordance();
 }
 
 function selectCoverImage(index) {
@@ -1267,11 +1300,289 @@ function selectCoverImage(index) {
     selectedCoverImage = {
         name: zipImages[index].name,
         mime: zipImages[index].mime,
-        base64: zipImages[index].base64
+        base64: zipImages[index].base64,
+        // 之前调过裁切就带过来，重新选中不会丢
+        crop: zipImages[index].crop ? { ...zipImages[index].crop } : null
     };
 
     imagePreviewTitle.textContent = '图片预览 (点击选择封面，再点一次取消)';
+    updateCropAffordance();
 }
+
+// --- 封面裁切（头像式：方框固定，拖图片平移 + 滑块缩放）---
+
+const MIN_CROP_ZOOM = 1;
+const MAX_CROP_ZOOM = 4;
+const COVER_OUTPUT_SIZE = 800;
+
+let cropSession = null; // { index, width, height, viewport, baseScale, zoom, offsetX, offsetY }
+let cropDrag = null;
+
+function clampNumber(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+}
+
+/** 当前封面在候选图列表里的下标；没选封面就是 -1 */
+function selectedCoverIndex() {
+    if (!selectedCoverImage) return -1;
+
+    return zipImages.findIndex(img => img.base64 === selectedCoverImage.base64);
+}
+
+/** 非 1:1 的封面默认居中裁切，这里把"可以自己框"的入口露出来 */
+function updateCropAffordance() {
+    const index = selectedCoverIndex();
+
+    if (index < 0) {
+        cropOpenBtn.classList.add('hidden');
+        cropHint.classList.add('hidden');
+        cropHint.textContent = '';
+        return;
+    }
+
+    const source = zipImages[index];
+
+    cropOpenBtn.classList.remove('hidden');
+    cropOpenBtn.textContent = source.crop ? '重新调整裁切…' : '调整封面裁切…';
+
+    if (source.crop) {
+        cropHint.textContent = `已自定义裁切区域（原图 ${source.width || '?'}×${source.height || '?'}，裁切 ${source.crop.size}×${source.crop.size}）`;
+        cropHint.className = 'text-xs text-gray-400 mb-2';
+        return;
+    }
+
+    if (source.width && source.height && source.width !== source.height) {
+        cropHint.textContent = `这张封面是 ${source.width}×${source.height}，不是正方形，默认取正中间的正方形。点上面的「调整封面裁切…」可以自己拖动选择区域。`;
+        cropHint.className = 'text-xs text-amber-600 mb-2';
+        return;
+    }
+
+    cropHint.classList.add('hidden');
+}
+
+async function openCropEditor() {
+    const index = selectedCoverIndex();
+
+    if (index < 0) return;
+
+    const source = zipImages[index];
+
+    cropModal.classList.remove('hidden');
+    cropBusy.classList.remove('hidden');
+    cropZoom.value = '100';
+    cropZoomLabel.textContent = '100%';
+
+    let bitmap;
+
+    try {
+        bitmap = await loadImageBitmapCompatible(base64ToBlob(source.base64, source.mime));
+    } catch (error) {
+        console.error('读取封面图片失败:', error);
+        closeCropEditor();
+        showStatusMessage(`无法读取这张封面：${error.message}`);
+        return;
+    }
+
+    if (!bitmap.width || !bitmap.height) {
+        closeCropEditor();
+        showStatusMessage('无法读取这张封面的尺寸。');
+        return;
+    }
+
+    cropBusy.classList.add('hidden');
+    source.width = bitmap.width;
+    source.height = bitmap.height;
+
+    // 要等弹窗显示出来才量得到宽度
+    const viewport = cropViewport.clientWidth || 288;
+
+    cropSession = {
+        index,
+        width: bitmap.width,
+        height: bitmap.height,
+        viewport,
+        baseScale: viewport / Math.min(bitmap.width, bitmap.height),
+        zoom: 1,
+        offsetX: 0,
+        offsetY: 0
+    };
+
+    if (source.mime) cropImage.src = `data:${source.mime};base64,${source.base64}`;
+
+    if (source.crop && source.crop.size > 0) restoreCropSession(cropSession, source.crop);
+    else centerCropSession(cropSession);
+
+    cropZoom.value = String(Math.round(cropSession.zoom * 100));
+    cropZoomLabel.textContent = `${Math.round(cropSession.zoom * 100)}%`;
+
+    renderCropSession();
+}
+
+/** 把已保存的裁切区域还原成缩放/位移，用户再打开时接着调 */
+function restoreCropSession(session, crop) {
+    const scale = session.viewport / crop.size;
+
+    session.zoom = clampNumber(scale / session.baseScale, MIN_CROP_ZOOM, MAX_CROP_ZOOM);
+    session.offsetX = -crop.x * session.baseScale * session.zoom;
+    session.offsetY = -crop.y * session.baseScale * session.zoom;
+
+    clampCropSession(session);
+}
+
+function centerCropSession(session) {
+    session.zoom = 1;
+    session.offsetX = (session.viewport - session.width * session.baseScale) / 2;
+    session.offsetY = (session.viewport - session.height * session.baseScale) / 2;
+
+    clampCropSession(session);
+}
+
+/** 图片必须始终盖满方框，所以左上角只能在 [方框 - 图片尺寸, 0] 之间 */
+function clampCropSession(session) {
+    const scale = session.baseScale * session.zoom;
+
+    session.offsetX = clampNumber(session.offsetX, session.viewport - session.width * scale, 0);
+    session.offsetY = clampNumber(session.offsetY, session.viewport - session.height * scale, 0);
+}
+
+/** 方框对应原图上的哪一块（原图像素坐标） */
+function cropRectFromSession(session) {
+    const scale = session.baseScale * session.zoom;
+
+    return {
+        x: -session.offsetX / scale,
+        y: -session.offsetY / scale,
+        size: session.viewport / scale
+    };
+}
+
+function renderCropSession() {
+    if (!cropSession) return;
+
+    const scale = cropSession.baseScale * cropSession.zoom;
+
+    cropImage.style.width = `${cropSession.width * scale}px`;
+    cropImage.style.height = `${cropSession.height * scale}px`;
+    cropImage.style.left = `${cropSession.offsetX}px`;
+    cropImage.style.top = `${cropSession.offsetY}px`;
+
+    const crop = cropRectFromSession(cropSession);
+    const output = Math.min(COVER_OUTPUT_SIZE, Math.round(crop.size));
+
+    cropSizeLabel.textContent = `裁切 ${Math.round(crop.size)}×${Math.round(crop.size)} 像素 → 写入封面 ${output}×${output}（原图 ${cropSession.width}×${cropSession.height}）`;
+}
+
+function setCropZoom(nextZoom) {
+    if (!cropSession) return;
+
+    const zoom = clampNumber(nextZoom, MIN_CROP_ZOOM, MAX_CROP_ZOOM);
+    const scaleOld = cropSession.baseScale * cropSession.zoom;
+    const scaleNew = cropSession.baseScale * zoom;
+
+    // 以方框中心为锚点缩放，画面不会乱跳
+    const centerX = (cropSession.viewport / 2 - cropSession.offsetX) / scaleOld;
+    const centerY = (cropSession.viewport / 2 - cropSession.offsetY) / scaleOld;
+
+    cropSession.zoom = zoom;
+    cropSession.offsetX = cropSession.viewport / 2 - centerX * scaleNew;
+    cropSession.offsetY = cropSession.viewport / 2 - centerY * scaleNew;
+
+    clampCropSession(cropSession);
+
+    cropZoom.value = String(Math.round(zoom * 100));
+    cropZoomLabel.textContent = `${Math.round(zoom * 100)}%`;
+
+    renderCropSession();
+}
+
+function closeCropEditor() {
+    cropModal.classList.add('hidden');
+    cropViewport.classList.remove('dragging');
+
+    cropSession = null;
+    cropDrag = null;
+}
+
+cropOpenBtn.addEventListener('click', () => openCropEditor());
+cropConfirmBtn.addEventListener('click', () => confirmCrop());
+cropResetBtn.addEventListener('click', () => {
+    if (!cropSession) return;
+
+    centerCropSession(cropSession);
+    cropZoom.value = '100';
+    cropZoomLabel.textContent = '100%';
+    renderCropSession();
+});
+cropCancelBtn.addEventListener('click', () => closeCropEditor());
+
+function confirmCrop() {
+    if (!cropSession) return;
+
+    const crop = cropRectFromSession(cropSession);
+    const source = zipImages[cropSession.index];
+
+    source.crop = {
+        x: Math.round(crop.x),
+        y: Math.round(crop.y),
+        size: Math.round(crop.size)
+    };
+
+    if (selectedCoverImage && selectedCoverImage.base64 === source.base64) {
+        selectedCoverImage.crop = { ...source.crop };
+    }
+
+    closeCropEditor();
+    updateCropAffordance();
+}
+
+cropViewport.addEventListener('pointerdown', event => {
+    if (!cropSession) return;
+
+    event.preventDefault();
+    cropDrag = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: cropSession.offsetX,
+        originY: cropSession.offsetY
+    };
+
+    cropViewport.classList.add('dragging');
+
+    try {
+        cropViewport.setPointerCapture(event.pointerId);
+    } catch {
+        // 某些环境不支持指针捕获，拖动仍然能用
+    }
+});
+
+cropViewport.addEventListener('pointermove', event => {
+    if (!cropDrag || !cropSession || event.pointerId !== cropDrag.pointerId) return;
+
+    cropSession.offsetX = cropDrag.originX + (event.clientX - cropDrag.startX);
+    cropSession.offsetY = cropDrag.originY + (event.clientY - cropDrag.startY);
+
+    clampCropSession(cropSession);
+    renderCropSession();
+});
+
+function endCropDrag(event) {
+    if (!cropDrag || (event && event.pointerId !== cropDrag.pointerId)) return;
+
+    cropDrag = null;
+    cropViewport.classList.remove('dragging');
+}
+
+cropViewport.addEventListener('pointerup', endCropDrag);
+cropViewport.addEventListener('pointercancel', endCropDrag);
+cropZoom.addEventListener('input', () => setCropZoom(Number(cropZoom.value) / 100));
+
+cropViewport.addEventListener('wheel', event => {
+    if (!cropSession) return;
+
+    event.preventDefault();
+    setCropZoom(cropSession.zoom * (event.deltaY < 0 ? 1.1 : 1 / 1.1));
+}, { passive: false });
 
 // --- 图片标准化：解决手机播放器不识别大图/Exif/非方图的问题 ---
 
@@ -1289,10 +1600,20 @@ async function normalizeCoverImage(imageBase64, imageMime, options = {}) {
         throw new Error('无法读取封面图片尺寸。');
     }
 
-    // 居中裁剪为正方形
-    const cropSize = Math.min(sourceWidth, sourceHeight);
-    const cropX = Math.floor((sourceWidth - cropSize) / 2);
-    const cropY = Math.floor((sourceHeight - cropSize) / 2);
+    // 裁切区域：用户在裁切器里框过就用他框的，否则居中取正方形
+    let cropSize;
+    let cropX;
+    let cropY;
+
+    if (options.crop && options.crop.size > 0) {
+        cropSize = Math.min(options.crop.size, sourceWidth, sourceHeight);
+        cropX = clampNumber(Math.round(options.crop.x), 0, sourceWidth - cropSize);
+        cropY = clampNumber(Math.round(options.crop.y), 0, sourceHeight - cropSize);
+    } else {
+        cropSize = Math.min(sourceWidth, sourceHeight);
+        cropX = Math.floor((sourceWidth - cropSize) / 2);
+        cropY = Math.floor((sourceHeight - cropSize) / 2);
+    }
 
     // 限制最大尺寸
     const targetSize = Math.min(maxSize, cropSize);
@@ -1665,10 +1986,16 @@ function findApicImageBytes(bytes) {
 // 2. 对 ID3v2.3 文件尽量保留原标签，只替换 APIC，缺失的文本帧再补上
 // 3. 非 ID3v2.3 或无标签时，写入一个新的 ID3v2.3 标签
 
-async function addId3v2Cover(mp3ArrayBuffer, imageBase64, imageMime, metadata = {}) {
+/**
+ * 写入 ID3v2 封面。
+ * crop 是原图像素坐标下的裁切区域 { x, y, size }（用户在裁切器里框的）；
+ * 不传就沿用历史行为——居中取正方形。
+ */
+async function addId3v2Cover(mp3ArrayBuffer, imageBase64, imageMime, metadata = {}, crop = null) {
     const normalizedCover = await normalizeCoverImage(imageBase64, imageMime, {
         maxSize: 800,
-        quality: 0.85
+        quality: 0.85,
+        crop
     });
 
     return applyNormalizedCover(mp3ArrayBuffer, normalizedCover, metadata);
@@ -2168,7 +2495,8 @@ async function fillZipFromEntries(outputZip, entries, job) {
                     (await entry.getBytes()).buffer,
                     coverImage.base64,
                     coverImage.mime,
-                    buildTrackMetadata(job.work, getBaseName(entry.outputName).replace(/\.[^.]+$/, ''))
+                    buildTrackMetadata(job.work, getBaseName(entry.outputName).replace(/\.[^.]+$/, '')),
+                    coverImage.crop
                 );
 
                 outputZip.file(joinZipPath(outputFolder, entry.outputName), new Blob([tagged], {
@@ -2218,7 +2546,8 @@ async function transcodeEntryToMp3(entry, options) {
             outputBuffer,
             options.coverImage.base64,
             options.coverImage.mime,
-            buildTrackMetadata(options.work, entry.name.replace(/\.[^.]+$/, ''))
+            buildTrackMetadata(options.work, entry.name.replace(/\.[^.]+$/, '')),
+            options.coverImage.crop
         );
     }
 
@@ -2487,7 +2816,8 @@ async function planFolderWrites(entries, job) {
                     (await entry.getBytes()).buffer,
                     job.coverImage.base64,
                     job.coverImage.mime,
-                    buildTrackMetadata(job.work, entry.name.replace(/\.[^.]+$/, ''))
+                    buildTrackMetadata(job.work, entry.name.replace(/\.[^.]+$/, '')),
+                    job.coverImage.crop
                 ),
                 deleteSource: flattenMovesSource(entry) ? entry.relPath : null
             });
