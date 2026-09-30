@@ -1,11 +1,16 @@
 // DOM 元素
 const tabDirect = document.getElementById('tab-direct');
 const tabZip = document.getElementById('tab-zip');
+const tabFolder = document.getElementById('tab-folder');
 const panelDirect = document.getElementById('panel-direct');
 const panelZip = document.getElementById('panel-zip');
+const panelFolder = document.getElementById('panel-folder');
 const dropZones = document.querySelectorAll('.drop-zone');
+const folderDropZone = document.getElementById('folder-drop-zone');
+const folderStatusText = document.getElementById('folder-status');
 const fileInputDirect = document.getElementById('file-input-direct');
 const fileInputZip = document.getElementById('file-input-zip');
+const fileInputFolder = document.getElementById('file-input-folder');
 const fileListContainer = document.getElementById('file-list-container');
 const fileListTitle = document.getElementById('file-list-title');
 const fileList = document.getElementById('file-list');
@@ -19,6 +24,7 @@ const zipOptions = document.getElementById('zip-options');
 const flattenCheckbox = document.getElementById('flatten-checkbox');
 const imagePreviewContainer = document.getElementById('image-preview-container');
 const imagePreviewGrid = document.getElementById('image-preview-grid');
+const imagePreviewTitle = document.getElementById('image-preview-title');
 const transcodeWavCheckbox = document.getElementById('transcode-wav-checkbox');
 const lameStatus = document.getElementById('lame-status');
 const progressContainer = document.getElementById('progress-container');
@@ -30,18 +36,33 @@ const workTitle = document.getElementById('work-title');
 const workMeta = document.getElementById('work-meta');
 const workLink = document.getElementById('work-link');
 const workStatus = document.getElementById('work-status');
+const folderOptions = document.getElementById('folder-options');
+const folderTranscodeCheckbox = document.getElementById('folder-transcode-wav-checkbox');
+const folderFlattenCheckbox = document.getElementById('folder-flatten-checkbox');
+const folderDeleteSourceCheckbox = document.getElementById('folder-delete-source-checkbox');
+const folderNote = document.getElementById('folder-note');
+const writebackModal = document.getElementById('writeback-modal');
+const writebackTitle = document.getElementById('writeback-title');
+const writebackTarget = document.getElementById('writeback-target');
+const writebackSummary = document.getElementById('writeback-summary');
+const writebackConfirm = document.getElementById('writeback-confirm');
+const writebackCancel = document.getElementById('writeback-cancel');
 
 // 状态
-let filesToProcess = []; // 统一存储待处理文件 { name, getContent }
+let filesToProcess = []; // 统一存储待处理 VTT 条目 { name, getContent }
 let loadedZip = null; // 存储上传的 ZIP 对象
-let originalInputName = null; // 存储原始输入文件名
+let originalInputName = null; // 存储原始输入名（ZIP 名 / 首个文件名 / 文件夹名）
 let zipImages = []; // { name, mime, base64 }
 let selectedCoverImage = null; // { mime, base64 } 或 null
-let currentTab = 'direct'; // direct | zip
+let currentTab = 'direct'; // direct | zip | folder
 let zipHasMp3 = false; // 包内是否有 MP3（用于文件列表提示）
 let zipWavCount = 0; // 包内 WAV 数量
 let isProcessing = false; // 正在转换中：禁止切标签/清空/换文件，避免打断正在跑的任务
 let currentWork = null; // 按 RJ 号查到的作品信息
+let folderStore = null; // { handle, canWrite, rootName } 文件夹模式的写回目标
+let folderScan = null; // { vttCount, wavCount, mp3Count, imageCount, otherCount, skippedDirs, truncated }
+let writebackConfirmHandler = null; // 写回确认弹窗当前的「确认」动作
+let modalResolver = null; // 当前等待用户回答的弹窗
 
 /**
  * RJ 元数据服务地址（Cloudflare Worker，部署方法见 worker/README.md）。
@@ -58,15 +79,20 @@ const RJ_LOOKUP_TIMEOUT = 20000;
 // （16~24 kHz 上限 160 kbps，≤12 kHz 上限 64 kbps）才会自动降到上限。
 const MP3_BITRATE = 320;
 
+/** 文件夹扫描的文件数上限：比这更多就别一次全塞进浏览器了 */
+const FOLDER_FILE_LIMIT = 8000;
+
 const TAB_ELEMENTS = {
     direct: { tab: tabDirect, panel: panelDirect },
-    zip: { tab: tabZip, panel: panelZip }
+    zip: { tab: tabZip, panel: panelZip },
+    folder: { tab: tabFolder, panel: panelFolder }
 };
 
 // --- 事件监听 ---
 
 tabDirect.addEventListener('click', () => switchTab('direct'));
 tabZip.addEventListener('click', () => switchTab('zip'));
+tabFolder.addEventListener('click', () => switchTab('folder'));
 
 dropZones.forEach(zone => {
     zone.addEventListener('dragover', e => {
@@ -87,6 +113,8 @@ dropZones.forEach(zone => {
 
         if (panel && panel.id === 'panel-zip') {
             if (files.length) handleZipFile(files[0]);
+        } else if (panel && panel.id === 'panel-folder') {
+            handleFolderDrop(e.dataTransfer);
         } else {
             handleDirectFiles(files);
         }
@@ -101,14 +129,52 @@ fileInputZip.addEventListener('change', e => {
     if (e.target.files.length) handleZipFile(e.target.files[0]);
 });
 
+fileInputFolder.addEventListener('change', e => {
+    if (e.target.files.length) handleFolderInputFiles(e.target.files);
+});
+
+folderDropZone.addEventListener('click', () => {
+    pickSourceFolder();
+});
+
+folderDropZone.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        pickSourceFolder();
+    }
+});
+
 transcodeWavCheckbox.addEventListener('change', refreshZipFileList);
+folderTranscodeCheckbox.addEventListener('change', refreshFolderFileList);
 
 convertBtn.addEventListener('click', convertAndDownload);
 clearBtn.addEventListener('click', clearFiles);
 
+writebackConfirm.addEventListener('click', () => resolveWritebackConfirm(true));
+writebackCancel.addEventListener('click', () => resolveWritebackConfirm(false));
+
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !writebackModal.classList.contains('hidden')) {
+        resolveWritebackConfirm(false);
+    }
+});
+
 updateLameStatus();
+updateFolderSupport();
 
 // --- 基础工具函数 ---
+
+function countZipWavFiles(zip) {
+    let count = 0;
+
+    for (const filename in zip.files) {
+        if (!zip.files[filename].dir && isWavFile(filename)) {
+            count++;
+        }
+    }
+
+    return count;
+}
 
 function escapeHtml(value) {
     return String(value)
@@ -159,12 +225,36 @@ function isZipFile(file) {
     return file.type.includes('zip') || /\.zip$/i.test(file.name);
 }
 
+function formatBytes(bytes) {
+    if (typeof WavToMp3 !== 'undefined' && WavToMp3.formatBytes) {
+        return WavToMp3.formatBytes(bytes);
+    }
+
+    const value = Number(bytes) || 0;
+
+    return value >= 1024 * 1024
+        ? `${(value / 1024 / 1024).toFixed(1)} MB`
+        : `${Math.max(1, Math.round(value / 1024))} KB`;
+}
+
+/** FNV-1a 32 位：用来判断"写回去的内容和现有文件是不是一模一样" */
+function computeDigest(bytes) {
+    let hash = 0x811C9DC5;
+
+    for (let i = 0; i < bytes.length; i++) {
+        hash ^= bytes[i];
+        hash = Math.imul(hash, 0x01000193);
+    }
+
+    return (hash >>> 0).toString(16);
+}
+
 /**
  * 把 ZIP 条目名里的反斜杠统一成斜杠。
  *
  * Windows 资源管理器 / Compress-Archive 打包时用反斜杠存路径
  * （音声压缩包基本都是这么来的），而反斜杠在 zip 规范里并不是分隔符，
- * 不处理的话输出包会出现 "作品集\第一話\01.mp3" 这种带反斜杠的怪文件名，
+ * 不处理的话输出包会出现 "作品集\第一话\01.mp3" 这种带反斜杠的怪文件名，
  * 解压时要么报错要么变成一个名字里带 \ 的文件。
  */
 function normalizeZipEntryNames(zip) {
@@ -222,7 +312,7 @@ function hideProgress() {
     progressText.textContent = '';
 }
 
-// --- 编码库状态 ---
+// --- 编码库 / 浏览器能力状态 ---
 
 function updateLameStatus() {
     if (typeof WavToMp3 === 'undefined') {
@@ -237,6 +327,22 @@ function updateLameStatus() {
     } else {
         lameStatus.textContent = '⚠ MP3 编码库 lamejs 未加载（可能是网络问题），请刷新页面后重试。';
         lameStatus.className = 'text-xs text-red-500 mt-2';
+    }
+}
+
+function updateFolderSupport() {
+    if (typeof FolderFs === 'undefined') {
+        folderStatusText.textContent = '⚠ 文件夹模块 folder.js 未加载，无法使用文件夹模式。';
+        folderStatusText.className = 'text-xs text-red-500 mt-2 text-center';
+        return;
+    }
+
+    if (FolderFs.isSupported()) {
+        folderStatusText.textContent = '可直接写回原文件夹：转换结果覆盖原路径的同名文件，动手前会先列出清单让你确认。';
+        folderStatusText.className = 'text-xs text-gray-400 mt-2 text-center';
+    } else {
+        folderStatusText.textContent = '⚠ 当前浏览器不支持直接写回文件夹（需要 Chrome / Edge 的 File System Access API）。仍然可以选文件夹读取并转换，结果会打包成 ZIP 下载。';
+        folderStatusText.className = 'text-xs text-amber-600 mt-2 text-center';
     }
 }
 
@@ -261,6 +367,7 @@ function switchTab(tabName) {
     });
 
     zipOptions.classList.toggle('hidden', tabName !== 'zip');
+    folderOptions.classList.toggle('hidden', tabName !== 'folder');
 
     clearFiles();
 }
@@ -274,14 +381,19 @@ function clearFiles() {
     zipHasMp3 = false;
     zipWavCount = 0;
     currentWork = null;
+    folderStore = null;
+    folderScan = null;
 
     hideWorkInfo();
+    closeWritebackModal();
 
     imagePreviewGrid.innerHTML = '';
+    imagePreviewTitle.textContent = '图片预览 (点击选择封面)';
     imagePreviewContainer.classList.add('hidden');
 
     fileInputDirect.value = '';
     fileInputZip.value = '';
+    fileInputFolder.value = '';
 
     fileList.innerHTML = '';
     fileListTitle.textContent = '待处理 VTT 文件';
@@ -353,7 +465,11 @@ function handleDirectFiles(inputFileList) {
         getContent: () => file.text()
     }));
 
-    updateFileListUI();
+    // 直传模式没有音频，把上一轮遗留的 WAV 计数清掉，免得列表里挂着过期的提示
+    zipWavCount = 0;
+    zipHasMp3 = false;
+
+    updateFileListUI(false, 0);
 }
 
 async function handleZipFile(zipFile) {
@@ -410,6 +526,238 @@ async function handleZipFile(zipFile) {
     }
 }
 
+// --- 文件夹模式：选择与扫描 ---
+
+/** 点「选择文件夹」：优先走可写句柄，浏览器不支持时降级到 <input webkitdirectory> */
+async function pickSourceFolder() {
+    if (isProcessing) {
+        showStatusMessage('正在转换中，请等当前任务完成后再选择文件夹。');
+        return;
+    }
+
+    if (typeof FolderFs === 'undefined') {
+        showStatusMessage('文件夹模块 folder.js 未加载，请刷新页面后重试。');
+        return;
+    }
+
+    if (!FolderFs.isSupported()) {
+        // Firefox / Safari：没有目录句柄 API，用 webkitdirectory 只读读入，结果打包下载
+        fileInputFolder.click();
+        return;
+    }
+
+    clearFiles();
+    showStatusMessage('请在系统弹窗里选择要处理的文件夹…', false);
+
+    let picked;
+
+    try {
+        picked = await FolderFs.pickDirectory();
+    } catch (error) {
+        if (FolderFs.isAbortError(error)) {
+            showStatusMessage('');
+            return;
+        }
+
+        console.error('选择文件夹失败:', error);
+        showStatusMessage(`选择文件夹失败：${error.message || '浏览器未允许访问'}。`);
+        return;
+    }
+
+    if (picked.canceled) {
+        showStatusMessage('');
+        return;
+    }
+
+    if (!picked.supported) {
+        fileInputFolder.click();
+        return;
+    }
+
+    await scanFolderHandle(picked.handle, picked.canWrite);
+}
+
+/** 降级路径：<input webkitdirectory> 或只读的拖拽目录 */
+async function handleFolderInputFiles(inputFileList) {
+    if (isProcessing) {
+        showStatusMessage('正在转换中，请等当前任务完成后再选择文件夹。');
+        return;
+    }
+
+    // 同样先快照：clearFiles() 会清空 input.value
+    const selectedFiles = Array.from(inputFileList);
+
+    clearFiles();
+
+    if (selectedFiles.length === 0) {
+        showStatusMessage('这个文件夹里没有可处理的文件。');
+        return;
+    }
+
+    const rootName = getFolderNameFromFiles(selectedFiles);
+    const handle = FolderFs.handleFromFiles(selectedFiles, rootName);
+
+    await scanFolderHandle(handle, false);
+}
+
+function getFolderNameFromFiles(files) {
+    for (const file of files) {
+        const relative = String(file.webkitRelativePath || '').split(/[\\/]/).filter(Boolean);
+
+        if (relative.length > 1) return relative[0];
+    }
+
+    return '所选文件夹';
+}
+
+/**
+ * 拖进来的东西里可能夹着目录。
+ * webkitGetAsEntry() 必须在事件处理期间同步调用（DataTransferItem 随后会失效），
+ * 所以这里先把 entry 抓完再 await。
+ */
+async function handleFolderDrop(dataTransfer) {
+    if (isProcessing) {
+        showStatusMessage('正在转换中，请等当前任务完成后再选择文件夹。');
+        return;
+    }
+
+    const items = dataTransfer && dataTransfer.items ? Array.from(dataTransfer.items) : [];
+    let directoryEntry = null;
+
+    for (const item of items) {
+        if (item.kind !== 'file') continue;
+
+        const entry = typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null;
+
+        if (entry && entry.isDirectory) {
+            directoryEntry = entry;
+            break;
+        }
+    }
+
+    if (!directoryEntry) {
+        const fileCount = dataTransfer && dataTransfer.files ? dataTransfer.files.length : 0;
+
+        showStatusMessage(fileCount
+            ? '拖进来的不是文件夹。想直接传 VTT 请用「上传多个 VTT 文件」标签页，或改点上面的选择框挑文件夹。'
+            : '没有识别到文件夹，请重试或改用点击选择。');
+
+        return;
+    }
+
+    let handle;
+
+    try {
+        // 拿到的是 FileSystemDirectoryHandle，是否可写要等写的时候才知道
+        handle = await directoryEntry.handle;
+    } catch (error) {
+        console.error('读取拖入的文件夹失败:', error);
+        showStatusMessage('读取拖入的文件夹失败，改用点击选择试试。');
+        return;
+    }
+
+    clearFiles();
+    await scanFolderHandle(handle, FolderFs.canWriteDirectory(handle));
+}
+
+/** 扫描目录 → 填充文件列表 / 图片预览 / RJ 联动 */
+async function scanFolderHandle(handle, canWrite) {
+    clearFiles();
+
+    const rootName = String(handle.name || '所选文件夹');
+
+    folderStore = {
+        handle,
+        canWrite: !!canWrite,
+        rootName
+    };
+
+    originalInputName = rootName;
+
+    setProgress(0.02, `正在扫描文件夹「${rootName}」…`);
+
+    try {
+        const scan = await FolderFs.scanDirectory(handle, {
+            maxDepth: FolderFs.MAX_DEPTH,
+            onProgress: message => setProgress(0.02, message)
+        });
+
+        let vttCount = 0;
+        let wavCount = 0;
+        let mp3Count = 0;
+        let imageCount = 0;
+        let otherCount = 0;
+
+        for (const file of scan.files) {
+            if (isVttFile(file.relPath)) vttCount++;
+            else if (isWavFile(file.relPath)) wavCount++;
+            else if (isMp3File(file.relPath)) mp3Count++;
+            else if (FolderFs.IMAGE_EXTENSIONS.test(file.relPath)) imageCount++;
+            else otherCount++;
+        }
+
+        folderScan = {
+            vttCount,
+            wavCount,
+            mp3Count,
+            imageCount,
+            otherCount,
+            skippedDirs: scan.skippedDirs,
+            truncated: scan.truncated
+        };
+
+        folderFileCache = scan.files;
+
+        const vttFiles = scan.files.filter(file => isVttFile(file.relPath));
+
+        filesToProcess = vttFiles.slice(0, FOLDER_FILE_LIMIT).map(file => ({
+            name: file.relPath,
+            getContent: async () => (await file.handle.getFile()).text()
+        }));
+
+        updateFileListUI(mp3Count > 0, wavCount);
+        await loadFolderImages(scan.files);
+        await lookupWorkByRj();
+    } catch (error) {
+        console.error('扫描文件夹失败:', error);
+        showStatusMessage(`扫描文件夹失败：${error.message || '请检查权限后重试'}。`);
+        folderStore = null;
+        folderScan = null;
+    } finally {
+        hideProgress();
+    }
+}
+
+/** 文件夹里的图片直接当封面候选（只在内存里读一次，不写回） */
+async function loadFolderImages(files) {
+    zipImages = [];
+    selectedCoverImage = null;
+
+    const imageFiles = files.filter(file => FolderFs.IMAGE_EXTENSIONS.test(file.relPath));
+
+    for (const file of imageFiles.slice(0, 60)) {
+        try {
+            const blob = await file.handle.getFile();
+
+            zipImages.push({
+                name: file.relPath,
+                mime: FolderFs.mimeForPath(file.relPath),
+                base64: await blobToBase64(blob)
+            });
+        } catch (error) {
+            console.warn(`读取图片失败：${file.relPath}`, error);
+        }
+    }
+
+    renderImageGrid();
+}
+
+function refreshFolderFileList() {
+    if (!folderStore || !folderScan) return;
+
+    updateFileListUI(folderScan.mp3Count > 0, folderScan.wavCount);
+}
+
 // --- 作品信息（RJ 号自动查询）---
 
 /** 从任意字符串里找出 RJ 号，形如 RJ344794 或 RJ01014447 */
@@ -419,11 +767,17 @@ function findRjCodeIn(text) {
     return match ? `RJ${match[1]}` : null;
 }
 
-/** 先在压缩包文件名里找 RJ 号，再退回到包内路径里找 */
+/** 先在压缩包名 / 文件夹名里找 RJ 号，再退回到包内路径里找 */
 function detectRjCode() {
-    const fromZipName = findRjCodeIn(originalInputName);
+    const fromInputName = findRjCodeIn(originalInputName);
 
-    if (fromZipName) return fromZipName;
+    if (fromInputName) return fromInputName;
+
+    for (const file of filesToProcess) {
+        const found = findRjCodeIn(file.name);
+
+        if (found) return found;
+    }
 
     if (!loadedZip) return null;
 
@@ -528,7 +882,7 @@ function renderWorkInfo(meta) {
     }
 }
 
-/** 上传压缩包后自动跑一遍：识别 RJ → 查作品 → 抓封面 */
+/** 选好文件夹 / 压缩包后自动跑一遍：识别 RJ → 查作品 → 抓封面 */
 async function lookupWorkByRj() {
     currentWork = null;
 
@@ -570,13 +924,20 @@ function updateFileListUI(hasMp3 = false, wavCount = 0) {
     zipHasMp3 = hasMp3;
     zipWavCount = wavCount;
 
-    const willTranscode = wavCount > 0 && transcodeWavCheckbox.checked;
+    const isFolderMode = currentTab === 'folder' && !!folderStore && !!folderScan;
+    const shouldTranscodeWav = isFolderMode ? folderTranscodeCheckbox.checked : transcodeWavCheckbox.checked;
+    const willTranscode = wavCount > 0 && shouldTranscodeWav;
     const hasWork = filesToProcess.length > 0 || hasMp3 || willTranscode;
 
+    fileListTitle.textContent = isFolderMode ? '待处理 VTT 文件（写回原路径）' : '待处理 VTT 文件';
+
     if (!hasWork) {
-        showStatusMessage('在上传的文件中未找到任何 .vtt、.mp3 或 .wav 文件。');
+        showStatusMessage(isFolderMode
+            ? '这个文件夹里没有找到 .vtt、.mp3 或 .wav 文件。'
+            : '在上传的文件中未找到任何 .vtt、.mp3 或 .wav 文件。');
         fileListContainer.classList.add('hidden');
         actionButtons.classList.add('hidden');
+        renderFolderNote();
         return;
     }
 
@@ -605,10 +966,12 @@ function updateFileListUI(hasMp3 = false, wavCount = 0) {
         fileList.appendChild(li);
     });
 
-    renderZipWavNote();
-
+    // 先让列表可见再渲染底部提示：renderFolderNote 会检查列表是不是隐藏的
     fileListContainer.classList.remove('hidden');
     actionButtons.classList.remove('hidden');
+
+    renderZipWavNote();
+    renderFolderNote();
 }
 
 /** 在文件列表里提示包内 WAV 会被转码还是原样保留 */
@@ -633,7 +996,49 @@ function renderZipWavNote() {
 function refreshZipFileList() {
     if (!loadedZip) return;
 
-    updateFileListUI(zipHasMp3, zipWavCount);
+    updateFileListUI(zipHasMp3, countZipWavFiles(loadedZip));
+}
+/** 文件夹模式：文件列表里额外说清"会写到哪里" */
+function renderFolderNote() {
+    const existing = document.getElementById('folder-wav-note');
+
+    if (existing) existing.remove();
+
+    if (currentTab !== 'folder' || !folderStore || !folderScan) {
+        folderNote.textContent = '';
+        return;
+    }
+
+    const parts = [];
+
+    if (folderScan.wavCount) {
+        parts.push(folderTranscodeCheckbox.checked
+            ? `${folderScan.wavCount} 个 WAV 将转码为 MP3 并写回原路径`
+            : `${folderScan.wavCount} 个 WAV 会原样保留（未勾选转码）`);
+    }
+
+    if (folderScan.imageCount) parts.push(`${folderScan.imageCount} 张图片可用于封面`);
+    if (folderScan.otherCount) parts.push(`${folderScan.otherCount} 个其它文件不会被改动`);
+    if (folderScan.skippedDirs.length) parts.push(`有 ${folderScan.skippedDirs.length} 个子目录读不动，已跳过`);
+    if (folderScan.truncated) parts.push('目录层级过深，只扫描了前面若干层');
+
+    folderNote.textContent = parts.length ? `${parts.join('；')}。` : '';
+    folderNote.className = folderScan.skippedDirs.length || folderScan.truncated
+        ? 'text-xs text-amber-600 mt-2'
+        : 'text-xs text-gray-400 mt-2';
+
+    if (!fileList || fileListContainer.classList.contains('hidden') || !folderScan.wavCount) return;
+
+    const li = document.createElement('li');
+
+
+    li.id = 'folder-wav-note';
+    li.className = 'text-sm text-blue-700 bg-blue-50 p-3 rounded-lg';
+    li.innerHTML = folderTranscodeCheckbox.checked
+        ? `另有 ${folderScan.wavCount} 个 WAV 将转码后写回原路径，原文件${folderDeleteSourceCheckbox.checked ? '会被删除' : '保留'}`
+        : `另有 ${folderScan.wavCount} 个 WAV 将原样保留（未勾选转码）`;
+
+    fileList.appendChild(li);
 }
 
 // --- VTT 转 LRC ---
@@ -773,6 +1178,7 @@ function renderImageGrid() {
         const wrapper = document.createElement('div');
         wrapper.className = 'image-thumb-wrapper';
         wrapper.dataset.index = String(index);
+        wrapper.dataset.name = img.name;
         wrapper.title = img.name;
 
         const image = document.createElement('img');
@@ -795,15 +1201,22 @@ function renderImageGrid() {
         imagePreviewGrid.appendChild(wrapper);
     });
 
+    imagePreviewTitle.textContent = selectedCoverImage
+        ? '图片预览 (点击选择封面，再点一次取消)'
+        : '图片预览 (点击选择封面)';
+
     imagePreviewContainer.classList.remove('hidden');
 }
 
 function selectCoverImage(index) {
     const wrappers = imagePreviewGrid.querySelectorAll('.image-thumb-wrapper');
 
+    if (!zipImages[index]) return;
+
     if (selectedCoverImage && selectedCoverImage.base64 === zipImages[index].base64) {
         selectedCoverImage = null;
         wrappers[index].classList.remove('selected');
+        imagePreviewTitle.textContent = '图片预览 (点击选择封面)';
         return;
     }
 
@@ -815,6 +1228,8 @@ function selectCoverImage(index) {
         mime: zipImages[index].mime,
         base64: zipImages[index].base64
     };
+
+    imagePreviewTitle.textContent = '图片预览 (点击选择封面，再点一次取消)';
 }
 
 // --- 图片标准化：解决手机播放器不识别大图/Exif/非方图的问题 ---
@@ -1173,6 +1588,36 @@ function base64ToUint8Array(base64) {
     return bytes;
 }
 
+/** 取 MP3 里已有的 APIC 图片字节（用于判断"封面已经是这张了，不用重写"） */
+function findApicImageBytes(bytes) {
+    const parsed = parseId3v2(bytes);
+
+    if (!parsed.hasTag) return null;
+
+    for (const frame of parseId3v23Frames(parsed.frameData)) {
+        if (frame.id !== 'APIC') continue;
+
+        const content = frame.bytes.slice(10);
+        let offset = 1; // 文本编码
+        const mimeEnd = content.indexOf(0x00, offset);
+
+        if (mimeEnd < 0) continue;
+
+        offset = mimeEnd + 1;
+
+        if (offset >= content.length) continue;
+
+        offset += 1; // 图片类型
+        const descriptionEnd = content.indexOf(0x00, offset);
+
+        if (descriptionEnd < 0) continue;
+
+        return content.slice(descriptionEnd + 1);
+    }
+
+    return null;
+}
+
 // --- ID3v2 封面写入 ---
 // 重点改进：
 // 1. 写入前把封面压缩成 800x800 JPEG
@@ -1185,6 +1630,11 @@ async function addId3v2Cover(mp3ArrayBuffer, imageBase64, imageMime, metadata = 
         quality: 0.85
     });
 
+    return applyNormalizedCover(mp3ArrayBuffer, normalizedCover, metadata);
+}
+
+/** 已经压好尺寸的封面直接嵌，省掉重复解码 */
+function applyNormalizedCover(mp3ArrayBuffer, normalizedCover, metadata = {}) {
     const imageBytes = base64ToUint8Array(normalizedCover.base64);
     const mp3Bytes = new Uint8Array(mp3ArrayBuffer);
     const parsed = parseId3v2(mp3Bytes);
@@ -1221,7 +1671,131 @@ async function addId3v2Cover(mp3ArrayBuffer, imageBase64, imageMime, metadata = 
     return result.buffer;
 }
 
-// --- ZIP 输出辅助 ---
+// --- 统一虚拟条目：ZIP / 文件夹 / 只读文件夹都用同一套结构 ---
+
+async function blobToBytes(blob) {
+    return new Uint8Array(await blob.arrayBuffer());
+}
+
+/**
+ * 把任务的数据来源统一成"虚拟条目"列表：
+ *   { path, relPath, name, kind, size, getBlob, getBytes, getText, getDigest }
+ *
+ * 这样后面的转换、打包、写回都只认这一种结构，不必到处判断
+ * "现在是 ZIP 还是文件夹"。digest 只算一次并缓存，写回时用来
+ * 判断"内容没变就跳过"，避免无谓地改动文件时间戳。
+ */
+async function buildVirtualEntries(job) {
+    if (job.sourceKind === 'zip') {
+        const entries = [];
+
+        for (const filename in job.zip.files) {
+            const zipEntry = job.zip.files[filename];
+
+            if (zipEntry.dir) continue;
+
+            entries.push(createZipEntrySource(filename, zipEntry));
+        }
+
+        return entries;
+    }
+
+    if (job.sourceKind === 'folder') {
+        const rootName = job.folderRootName || 'folder';
+
+        return (job.directoryFiles || []).map(file => createFolderEntrySource(file, rootName));
+    }
+
+    // 直传模式：只有用户挑中的那几个 VTT
+    return (job.files || []).map(file => ({
+        path: file.name,
+        relPath: file.name,
+        name: file.name,
+        kind: 'vtt',
+        size: 0,
+        async getBlob() {
+            return new Blob([await file.getContent()], { type: 'text/vtt' });
+        },
+        async getBytes() {
+            return new TextEncoder().encode(await file.getContent());
+        },
+        getText: () => file.getContent(),
+        async getDigest() {
+            return computeDigest(new TextEncoder().encode(await file.getContent()));
+        }
+    }));
+}
+
+function createZipEntrySource(filename, zipEntry) {
+    let bytesCache = null;
+    let digestCache = null;
+
+    return {
+        path: filename,
+        relPath: filename,
+        name: getBaseName(filename),
+        kind: entryKindFor(filename),
+        size: 0,
+        async getBlob() {
+            return zipEntry.async('blob');
+        },
+        async getBytes() {
+            if (!bytesCache) bytesCache = new Uint8Array(await zipEntry.async('arraybuffer'));
+
+            return bytesCache;
+        },
+        async getText() {
+            return zipEntry.async('string');
+        },
+        async getDigest() {
+            if (!digestCache) digestCache = computeDigest(await this.getBytes());
+
+            return digestCache;
+        }
+    };
+}
+
+function createFolderEntrySource(file, rootName) {
+    let bytesCache = null;
+    let digestCache = null;
+
+    async function readBytes() {
+        if (!bytesCache) bytesCache = new Uint8Array(await (await file.handle.getFile()).arrayBuffer());
+
+        return bytesCache;
+    }
+
+    return {
+        path: `${rootName}/${file.relPath}`,
+        relPath: file.relPath,
+        name: file.name,
+        kind: entryKindFor(file.relPath),
+        size: file.size || 0,
+        async getBlob() {
+            return file.handle.getFile();
+        },
+        getBytes: readBytes,
+        async getText() {
+            return (await file.handle.getFile()).text();
+        },
+        async getDigest() {
+            if (!digestCache) digestCache = computeDigest(await readBytes());
+
+            return digestCache;
+        }
+    };
+}
+
+function entryKindFor(filePath) {
+    if (isVttFile(filePath)) return 'vtt';
+    if (isWavFile(filePath)) return 'wav';
+    if (isMp3File(filePath)) return 'mp3';
+    if (typeof FolderFs !== 'undefined' && FolderFs.IMAGE_EXTENSIONS.test(filePath)) return 'image';
+
+    return 'other';
+}
+
+// --- 输出名计算 ---
 
 function getOutputFolderNameFromZip(zip, zipFileName) {
     let fallback = '';
@@ -1307,6 +1881,49 @@ function addNumberSuffixUntilUnique(filename, existingNames) {
     return candidate;
 }
 
+/**
+ * 给每个条目定好"输出到哪个相对路径"（平铺模式会重命名）。
+ *
+ * 必须一次算完并固化到条目上，不能每次用到再算：createFlattenedName 内部
+ * 带重名计数，分两次算（规划一次、执行一次）会各自从零开始，得到不一样的名字。
+ * 返回的 takenNames 里已经装了所有输出名，后面转码再产生新名字时用它排重，
+ * 这样"转码出的 MP3 名"和"本来就存在的 MP3 名"不会撞车。
+ */
+function resolveOutputNames(entries, job) {
+    const existingNames = new Set();
+    const takenNames = new Set();
+
+    entries.forEach(entry => {
+        // 写回原路径时默认保结构，只有勾了平铺才改名字
+        entry.outputName = job.shouldFlatten
+            ? createFlattenedName(entry.path, existingNames)
+            : entry.relPath;
+    });
+
+    entries.forEach(entry => takenNames.add(entry.outputName));
+
+    return takenNames;
+}
+
+/**
+ * 平铺会把这些文件搬到根目录，重名时只能"跳过"而不是改名字
+ * （改名字会让 歌曲.mp3 和 歌曲.lrc 对不上）。
+ * 所以先在界面上说清风险，而不是等用户确认后才发现一半文件没写。
+ */
+function buildFlattenHint(job) {
+    if (!job.shouldFlatten || !job.directoryFiles) return '';
+
+    let nested = 0;
+
+    for (const file of job.directoryFiles) {
+        if (file.relPath.includes('/')) nested++;
+    }
+
+    if (nested === 0) return '';
+
+    return `已勾选平铺：${nested} 个子目录里的文件会被搬到根目录，重名的（比如不同作品下同名的 01.mp3）只会写第一个，其余跳过。建议不勾选平铺。`;
+}
+
 // --- 转换与下载 ---
 
 /**
@@ -1315,24 +1932,44 @@ function addNumberSuffixUntilUnique(filename, existingNames) {
  * 不再实时读全局变量，这样任何界面状态变化都不会影响正在进行的转换。
  */
 function createJob() {
-    const isZipMode = !!loadedZip;
+    const isFolderMode = !!folderStore;
+    const isZipMode = !isFolderMode && !!loadedZip;
 
     return {
-        isZipMode,
+        sourceKind: isFolderMode ? 'folder' : (isZipMode ? 'zip' : 'direct'),
+        directoryHandle: isFolderMode ? folderStore.handle : null,
+        folderRootName: isFolderMode ? folderStore.rootName : null,
+        directoryWritable: isFolderMode ? !!folderStore.canWrite : false,
+        directoryFiles: isFolderMode ? folderFileCache : null,
         zip: loadedZip,
         files: filesToProcess,
         zipName: originalInputName,
         coverImage: selectedCoverImage, // 封面快照，最关键的一项
         work: currentWork, // 作品信息快照（用于写 ID3 的专辑/艺术家）
-        shouldFlatten: flattenCheckbox.checked,
-        shouldTranscodeWav: transcodeWavCheckbox.checked,
+        shouldFlatten: isFolderMode ? folderFlattenCheckbox.checked : flattenCheckbox.checked,
+        shouldTranscodeWav: isFolderMode ? folderTranscodeCheckbox.checked : transcodeWavCheckbox.checked,
+        shouldDeleteSource: isFolderMode ? folderDeleteSourceCheckbox.checked : false,
         bitrate: MP3_BITRATE
     };
 }
 
 async function convertAndDownload() {
     if (isProcessing) return;
-    if (filesToProcess.length === 0 && !loadedZip) return;
+    if (filesToProcess.length === 0 && !loadedZip && !folderStore) return;
+
+    // 文件夹的完整清单要扫一遍才知道，而扫描是异步的：先扫完再冻结快照，
+    // 后面整条流水线就只认这份快照了
+    if (folderStore) {
+        try {
+            setProgress(0.01, '正在读取文件夹清单…');
+            await loadFolderFileCache();
+        } catch (error) {
+            console.error('读取文件夹失败:', error);
+            hideProgress();
+            showStatusMessage(`读取文件夹失败：${error.message || '请重新选择文件夹'}。`);
+            return;
+        }
+    }
 
     const job = createJob();
 
@@ -1341,24 +1978,20 @@ async function convertAndDownload() {
     showStatusMessage('');
 
     try {
-        const outputZip = new JSZip();
-
-        const result = job.isZipMode
-            ? await processZipMode(outputZip, job)
-            : await processDirectVttMode(outputZip, job);
-
-        const zipBlob = await outputZip.generateAsync({
-            type: 'blob'
-        });
-
-        downloadBlob(zipBlob, getDownloadName(job));
-
-        const warnings = (result && result.warnings) || [];
-
-        if (warnings.length > 0) {
-            showStatusMessage(`处理完成，但有以下文件未能转码：${warnings.join('；')}`);
+        if (job.sourceKind === 'folder' && job.directoryWritable) {
+            await processFolderWriteBack(job);
         } else {
-            showStatusMessage('处理完成。', false);
+            const entries = await buildVirtualEntries(job);
+            const outputZip = new JSZip();
+            const result = await fillZipFromEntries(outputZip, entries, job);
+            const zipBlob = await outputZip.generateAsync({
+                type: 'blob'
+            });
+            const downloadName = getDownloadName(job);
+
+            downloadBlob(zipBlob, downloadName);
+
+            showResultMessage(result, `处理完成，已下载 ${downloadName}。`);
         }
     } catch (error) {
         console.error('转换或下载过程中发生错误:', error);
@@ -1370,28 +2003,119 @@ async function convertAndDownload() {
     }
 }
 
-// --- ZIP 模式内的 WAV 转码 ---
+function showResultMessage(result, successText) {
+    const warnings = (result && result.warnings) || [];
 
-function countZipWavFiles(zip) {
-    let count = 0;
-
-    for (const filename in zip.files) {
-        if (!zip.files[filename].dir && isWavFile(filename)) {
-            count++;
-        }
+    if (warnings.length > 0) {
+        showStatusMessage(`${successText} 但有以下文件未处理成功：${warnings.join('；')}`);
+    } else {
+        showStatusMessage(successText, false);
     }
-
-    return count;
 }
 
-function uniqueOutputName(candidate, takenNames) {
-    const name = takenNames.has(candidate)
-        ? addNumberSuffixUntilUnique(candidate, takenNames)
-        : candidate;
+/** 文件夹模式下的文件清单缓存，避免重复扫目录 */
+let folderFileCache = null;
 
-    takenNames.add(name);
+async function loadFolderFileCache() {
+    const handle = folderStore && folderStore.handle;
 
-    return name;
+    if (!handle) throw new Error('没有可用的文件夹句柄。');
+
+    // 选文件夹时已经扫过一遍，直接复用；只有缓存丢了才重新扫（重扫可能再弹一次授权）
+    if (folderFileCache) return folderFileCache;
+
+    const scan = await FolderFs.scanDirectory(handle);
+
+    folderFileCache = scan.files;
+
+    return folderFileCache;
+}
+
+// --- 目标一：打包成 ZIP（ZIP 模式 / 直传 VTT / 只读文件夹）---
+
+async function fillZipFromEntries(outputZip, entries, job) {
+    const bitrate = job.bitrate;
+    const coverImage = job.coverImage; // 用快照，避免中途被 clearFiles 清掉
+    const warnings = [];
+    const outputFolder = job.sourceKind === 'zip'
+        ? getOutputFolderNameFromZip(job.zip, job.zipName)
+        : '';
+
+    // 已占用的输出名：所有条目的输出名，跨条目排重
+    const takenNames = resolveOutputNames(entries, job);
+
+    const wavEntries = job.shouldTranscodeWav
+        ? entries.filter(entry => entry.kind === 'wav')
+        : [];
+
+    let wavIndex = 0;
+
+    for (const entry of entries) {
+        if (entry.kind === 'vtt') {
+            const lrcContent = convertVttToLrc(await entry.getText());
+
+            outputZip.file(joinZipPath(outputFolder, getLrcFilename(entry.outputName)), lrcContent);            continue;
+        }
+
+        if (entry.kind === 'wav' && job.shouldTranscodeWav) {
+            wavIndex++;
+
+            const mp3Name = uniqueOutputName(toMp3Filename(entry.outputName), takenNames);
+
+            const label = wavEntries.length > 1
+                ? `(${wavIndex}/${wavEntries.length}) ${entry.name}`
+                : entry.name;
+
+            try {
+                const result = await transcodeEntryToMp3(entry, {
+                    bitrate,
+                    coverImage,
+                    work: job.work,
+                    onProgress: (ratio, message) => setProgress(
+                        (wavIndex - 1 + ratio) / wavEntries.length,
+                        `转码 WAV ${label} — ${message || ''}`
+                    )
+                });
+
+                outputZip.file(joinZipPath(outputFolder, mp3Name), new Blob([result], {
+                    type: 'audio/mpeg'
+                }));
+            } catch (error) {
+                // 转码失败就原样保留，不打断整包处理
+                console.error(`WAV 转码失败：${entry.path}`, error);
+                warnings.push(`${entry.name}（${error.message}）`);
+
+                outputZip.file(joinZipPath(outputFolder, entry.outputName), await entry.getBlob());
+            }
+
+            continue;
+        }
+
+        if (entry.kind === 'mp3' && coverImage) {
+            try {
+                const tagged = await addId3v2Cover(
+                    (await entry.getBytes()).buffer,
+                    coverImage.base64,
+                    coverImage.mime,
+                    buildTrackMetadata(job.work, getBaseName(entry.outputName).replace(/\.[^.]+$/, ''))
+                );
+
+                outputZip.file(joinZipPath(outputFolder, entry.outputName), new Blob([tagged], {
+                    type: 'audio/mpeg'
+                }));
+            } catch (error) {
+                console.error(`写入封面失败：${entry.path}`, error);
+                warnings.push(`${entry.name}（${error.message}）`);
+                outputZip.file(joinZipPath(outputFolder, entry.outputName), await entry.getBlob());
+            }
+
+            continue;
+        }
+
+        outputZip.file(joinZipPath(outputFolder, entry.outputName), await entry.getBlob());
+    }
+
+    return { warnings };
 }
 
 /** 用作品信息补全 ID3 的专辑/艺术家等字段（查不到作品时留空） */
@@ -1409,145 +2133,46 @@ function buildTrackMetadata(work, trackTitle) {
     return metadata;
 }
 
-async function processZipMode(outputZip, job) {
-    const shouldFlatten = job.shouldFlatten;
-    const shouldTranscodeWav = job.shouldTranscodeWav;
-    const bitrate = job.bitrate;
-    const coverImage = job.coverImage; // 用快照，避免中途被 clearFiles 清掉
-    const existingNames = new Set();
-    const outputFolder = getOutputFolderNameFromZip(job.zip, job.zipName);
+async function transcodeEntryToMp3(entry, options) {
+    const arrayBuffer = (await entry.getBytes()).buffer;
+    const result = await WavToMp3.wavToMp3(arrayBuffer, {
+        bitrate: options.bitrate,
+        onProgress: options.onProgress
+    });
 
-    // 非平铺模式保留原始路径，先把所有原始文件名登记下来，
-    // 免得转码出来的 MP3 覆盖掉包内同名的 MP3
-    const reservedNames = new Set();
+    let outputBuffer = result.data.buffer;
 
-    if (!shouldFlatten) {
-        for (const filename in job.zip.files) {
-            if (!job.zip.files[filename].dir) {
-                reservedNames.add(filename);
-            }
-        }
+    if (options.coverImage) {
+        outputBuffer = await addId3v2Cover(
+            outputBuffer,
+            options.coverImage.base64,
+            options.coverImage.mime,
+            buildTrackMetadata(options.work, entry.name.replace(/\.[^.]+$/, ''))
+        );
     }
 
-    const wavCount = shouldTranscodeWav ? countZipWavFiles(job.zip) : 0;
-    const warnings = [];
-    let wavIndex = 0;
-
-    for (const filename in job.zip.files) {
-        const zipEntry = job.zip.files[filename];
-        if (zipEntry.dir) continue;
-
-        const newName = shouldFlatten
-            ? createFlattenedName(filename, existingNames)
-            : filename;
-
-        if (isVttFile(filename)) {
-            const vttContent = await zipEntry.async('string');
-            const lrcContent = convertVttToLrc(vttContent);
-            const lrcFilename = shouldFlatten
-                ? getLrcFilename(newName)
-                : getLrcFilename(filename);
-
-            outputZip.file(joinZipPath(outputFolder, lrcFilename), lrcContent);
-            continue;
-        }
-
-        if (isWavFile(filename) && shouldTranscodeWav) {
-            wavIndex++;
-
-            const mp3Name = uniqueOutputName(
-                toMp3Filename(newName),
-                shouldFlatten ? existingNames : reservedNames
-            );
-
-            const label = wavCount > 1
-                ? `(${wavIndex}/${wavCount}) ${getBaseName(filename)}`
-                : getBaseName(filename);
-
-            try {
-                const arrayBuffer = await zipEntry.async('arraybuffer');
-
-                const result = await WavToMp3.wavToMp3(arrayBuffer, {
-                    bitrate,
-                    onProgress: (ratio, message) => setProgress(
-                        (wavIndex - 1 + ratio) / wavCount,
-                        `转码 WAV ${label} — ${message || ''}`
-                    )
-                });
-
-                let outputBuffer = result.data.buffer;
-
-                if (coverImage) {
-                    setProgress((wavIndex - 0.02) / wavCount, `转码 WAV ${label} — 正在写入封面…`);
-
-                    outputBuffer = await addId3v2Cover(
-                        outputBuffer,
-                        coverImage.base64,
-                        coverImage.mime,
-                        buildTrackMetadata(job.work, getBaseName(filename).replace(/\.[^.]+$/, ''))
-                    );
-                }
-
-                outputZip.file(joinZipPath(outputFolder, mp3Name), new Blob([outputBuffer], {
-                    type: 'audio/mpeg'
-                }));
-            } catch (error) {
-                // 转码失败就原样保留，不打断整包处理
-                console.error(`WAV 转码失败：${filename}`, error);
-                warnings.push(`${getBaseName(filename)}（${error.message}）`);
-
-                const fileContent = await zipEntry.async('blob');
-
-                outputZip.file(joinZipPath(outputFolder, newName), fileContent);
-            }
-
-            continue;
-        }
-
-        if (isMp3File(filename) && coverImage) {
-            const arrayBuffer = await zipEntry.async('arraybuffer');
-
-            const taggedBuffer = await addId3v2Cover(
-                arrayBuffer,
-                coverImage.base64,
-                coverImage.mime,
-                buildTrackMetadata(job.work, getBaseName(newName).replace(/\.[^.]+$/, ''))
-            );
-
-            outputZip.file(
-                joinZipPath(outputFolder, newName),
-                new Blob([taggedBuffer], {
-                    type: 'audio/mpeg'
-                })
-            );
-
-            continue;
-        }
-
-        const fileContent = await zipEntry.async('blob');
-        outputZip.file(joinZipPath(outputFolder, newName), fileContent);
-    }
-
-    return { warnings };
+    return outputBuffer;
 }
 
-async function processDirectVttMode(outputZip, job) {
-    for (const file of job.files) {
-        const vttContent = await file.getContent();
-        const lrcContent = convertVttToLrc(vttContent);
-        const lrcFilename = getLrcFilename(file.name);
+function uniqueOutputName(candidate, takenNames) {
+    const name = takenNames.has(candidate)
+        ? addNumberSuffixUntilUnique(candidate, takenNames)
+        : candidate;
 
-        outputZip.file(lrcFilename, lrcContent);
-    }
+    takenNames.add(name);
+
+    return name;
 }
 
 function getDownloadName(job) {
     let downloadName = `converted_lrc_${Date.now()}.zip`;
 
-    if (job.isZipMode && job.zipName) {
+    if (job.sourceKind === 'zip' && job.zipName) {
         const baseName = job.zipName.replace(/\.zip$/i, '');
         downloadName = `${baseName}_after.zip`;
-    } else if (!job.isZipMode && job.zipName) {
+    } else if (job.sourceKind === 'folder' && job.folderRootName) {
+        downloadName = `${job.folderRootName}_after.zip`;
+    } else if (job.sourceKind === 'direct' && job.zipName) {
         const baseName = job.zipName.replace(/\.vtt$/i, '');
         downloadName = `${baseName}等等.zip`;
     }
@@ -1567,4 +2192,339 @@ function downloadBlob(blob, filename) {
     document.body.removeChild(a);
 
     URL.revokeObjectURL(downloadUrl);
+}
+
+// --- 目标二：写回原文件夹 ---
+
+/** 读一遍目录里已经存在的文件（只读元信息，不读内容），用于区分"新增"和"覆盖" */
+async function indexExistingPaths(handle, relativePaths) {
+    const distinct = [...new Set(relativePaths)];
+    const existing = new Set();
+    const directoryCache = new Map();
+
+    async function childNames(relativeDir) {
+        if (directoryCache.has(relativeDir)) return directoryCache.get(relativeDir);
+
+        let directory = handle;
+
+        if (relativeDir) {
+            try {
+                directory = await handle.getDirectoryHandle(relativeDir);
+            } catch {
+                const empty = new Set();
+
+                directoryCache.set(relativeDir, empty);
+                return empty;
+            }
+        }
+
+        const names = await listChildNames(directory);
+
+        directoryCache.set(relativeDir, names);
+
+        return names;
+    }
+
+    for (const relative of distinct) {
+        const parts = relative.split('/').filter(Boolean);
+
+        if (parts.length === 0) continue;
+
+        const fileName = parts.pop();
+        const names = await childNames(parts.join('/'));
+
+        if (names.has(fileName)) existing.add(relative);
+    }
+
+    return existing;
+}
+
+async function listChildNames(directoryHandle) {
+    const names = new Set();
+
+    try {
+        for await (const child of directoryHandle.values()) {
+            names.add(child.name);
+        }
+    } catch {
+        // 列不出来就当空目录
+    }
+
+    return names;
+}
+
+/**
+ * 先把要做的每一件事算清楚（写什么、覆盖谁、删什么），
+ * 再去执行。规划与执行严格分开，确认弹窗里显示的清单就是真正会发生的操作。
+ */
+async function planFolderWrites(entries, job) {
+    const targets = [];
+    const skipped = [];
+    const plan = { writes: [], newFiles: [], overwrites: [], deletes: [], skipped };
+
+    for (const entry of entries) {
+        const outputName = entry.outputName;
+
+        if (entry.kind === 'vtt') {
+            targets.push({
+                relPath: getLrcFilename(outputName),
+                source: entry,
+                typeLabel: 'LRC',
+                build: async () => convertVttToLrc(await entry.getText()),
+                // 勾了"剪掉源文件"就顺手删掉 VTT——和 ZIP 模式的输出一致（输出包里不会有 VTT）
+                deleteSource: job.shouldDeleteSource ? entry.relPath : null
+            });
+
+            continue;
+        }
+
+        if (entry.kind === 'wav' && job.shouldTranscodeWav) {
+            targets.push({
+                relPath: toMp3Filename(outputName),
+                source: entry,
+                typeLabel: 'MP3',
+                build: async () => transcodeEntryToMp3(entry, {
+                    bitrate: job.bitrate,
+                    coverImage: job.coverImage,
+                    work: job.work,
+                    onProgress: (ratio, message) => setProgress(
+                        0.05 + ratio * 0.9,
+                        `转码 WAV ${entry.name} — ${message || ''}`
+                    )
+                }),
+                deleteSource: job.shouldDeleteSource ? entry.relPath : null
+            });
+
+            continue;
+        }
+
+        if (entry.kind === 'mp3' && job.coverImage) {
+            targets.push({
+                relPath: outputName,
+                source: entry,
+                typeLabel: 'MP3 封面',
+                build: async () => addId3v2Cover(
+                    (await entry.getBytes()).buffer,
+                    job.coverImage.base64,
+                    job.coverImage.mime,
+                    buildTrackMetadata(job.work, entry.name.replace(/\.[^.]+$/, ''))
+                ),
+                deleteSource: null
+            });
+        }
+
+        // 图片和其它文件一律不动
+    }
+
+    // 同名目标只处理一次，例如「歌曲.wav」（转码成 歌曲.mp3）撞上本来就有的「歌曲.mp3」
+    const claimed = new Map();
+
+    for (const target of targets) {
+        const owner = claimed.get(target.relPath);
+
+        if (owner) {
+            skipped.push({
+                relPath: target.relPath,
+                reason: `与 ${owner.source.relPath} 的输出重名，已跳过「${target.source.relPath}」`
+            });
+
+            continue;
+        }
+
+        claimed.set(target.relPath, target);
+        plan.writes.push(target);
+    }
+
+    const existing = await indexExistingPaths(job.directoryHandle, plan.writes.map(target => target.relPath));
+    const deletionSet = new Set();
+
+    plan.writes.forEach(target => {
+        if (existing.has(target.relPath)) {
+            plan.overwrites.push(target.relPath);
+        } else {
+            plan.newFiles.push(target.relPath);
+        }
+
+        if (target.deleteSource && target.deleteSource !== target.relPath) {
+            // 去重：平铺时两个不同作品可能压到同一个输出名，但源文件只会被登记一次
+            deletionSet.add(target.deleteSource);
+        }
+    });
+
+    plan.deletes = [...deletionSet];
+
+    return plan;
+}
+
+function buildWritebackSummary(plan, handle) {
+    const blocks = [];
+    const maxItems = 12;
+
+    function block(title, items, className, hint) {
+        if (items.length === 0) return;
+
+        const shown = items.slice(0, maxItems);
+        const rest = items.length - shown.length;
+        const listItems = shown
+            .map(item => `<li>${escapeHtml(typeof item === 'string' ? item : item.relPath)}</li>`)
+            .join('');
+
+        blocks.push(`
+            <div class="writeback-heading ${className}">${title}（${items.length}）${hint ? ` <span class="font-normal">${hint}</span>` : ''}</div>
+            <ul class="writeback-list">${listItems}${rest > 0 ? `<li>…还有 ${rest} 个</li>` : ''}</ul>
+        `);
+    }
+
+    block('新增文件', plan.newFiles, 'is-new');
+    block('覆盖原文件', plan.overwrites, 'is-overwrite', '（原内容会被替换）');
+    block('删除源文件', plan.deletes, 'is-delete', '（转码成功后执行，不可撤销）');
+    block('跳过', plan.skipped.map(item => `${item.relPath} ← ${item.reason}`), 'is-skip');
+
+    const totalBytes = plan.writes
+        .map(target => target.source.size)
+        .filter(size => size > 0)
+        .reduce((sum, size) => sum + size, 0);
+
+    blocks.push(`
+        <p class="text-xs text-gray-500 mt-3">
+            目标文件夹：<span class="path-badge">${escapeHtml(handle.name || '')}</span>
+            ${totalBytes > 0 ? ` · 读取约 ${escapeHtml(formatBytes(totalBytes))}` : ''}
+        </p>
+    `);
+
+    return blocks.join('');
+}
+
+function openWritebackModal(plan, handle, job) {
+    writebackTitle.textContent = '确认写回原文件夹';
+
+    const mode = job.shouldFlatten ? '平铺到根目录' : '保持原有目录结构';
+    const hint = buildFlattenHint(job);
+
+    writebackTarget.textContent =
+        `「${handle.name || '所选文件夹'}」 · ${mode} · 共 ${plan.writes.length} 个文件将被写入`;
+
+    writebackSummary.innerHTML =
+        (hint ? `<p class="text-xs text-amber-600 mb-3">${escapeHtml(hint)}</p>` : '') +
+        buildWritebackSummary(plan, handle);
+
+    writebackModal.classList.remove('hidden');
+
+    return new Promise(resolve => {
+        modalResolver = resolve;
+    });
+}
+
+function resolveWritebackConfirm(confirmed) {
+    if (!modalResolver) return;
+
+    const resolve = modalResolver;
+
+    modalResolver = null;
+    writebackModal.classList.add('hidden');
+    resolve(confirmed);
+}
+
+function closeWritebackModal() {
+    writebackModal.classList.add('hidden');
+    modalResolver = null;
+}
+
+/** 写回：逐项转码 → 写入 → 最后删源文件（失败的原样保留） */
+async function executeFolderPlan(plan, job) {
+    const handle = job.directoryHandle;
+    const warnings = [];
+    const failedDeletes = [];
+    let writtenCount = 0;
+    let unchangedCount = 0;
+
+    for (let index = 0; index < plan.writes.length; index++) {
+        const target = plan.writes[index];
+        const label = `(${index + 1}/${plan.writes.length}) ${target.relPath}`;
+
+        try {
+            setProgress(index / plan.writes.length, `写入 ${label}`);
+
+            const data = await target.build();
+
+            // 内容一模一样就别写：既省时间，也不动文件时间戳
+            if (target.relPath !== target.source.relPath) {
+                const existingDigest = await readExistingDigest(handle, target.relPath);
+
+                if (existingDigest && existingDigest === computeDigest(toBytes(data))) {
+                    unchangedCount++;
+                    continue;
+                }
+            }
+
+            await FolderFs.writeFile(handle, target.relPath, data);
+            writtenCount++;
+        } catch (error) {
+            console.error(`写回失败：${target.relPath}`, error);
+            warnings.push(`${target.relPath}（${error.message}）`);
+        }
+    }
+
+    for (const relPath of plan.deletes) {
+        try {
+            setProgress(0.99, `删除源文件 ${relPath}`);
+            await FolderFs.deleteFile(handle, relPath);
+        } catch (error) {
+            console.error(`删除失败：${relPath}`, error);
+            failedDeletes.push(`${relPath}（${error.message}）`);
+        }
+    }
+
+    return { writtenCount, unchangedCount, warnings, failedDeletes };
+}
+
+function readExistingDigest(handle, relPath) {
+    return FolderFs.readFile(handle, relPath)
+        .then(bytes => computeDigest(bytes))
+        .catch(() => null);
+}
+
+function toBytes(data) {
+    return FolderFs.toBytes(data);
+}
+
+async function processFolderWriteBack(job) {
+    const entries = await buildVirtualEntries(job);
+
+    resolveOutputNames(entries, job);
+
+    setProgress(0.01, '正在核对目标文件夹…');
+
+    const plan = await planFolderWrites(entries, job);
+
+    if (plan.writes.length === 0) {
+        showStatusMessage(plan.skipped.length
+            ? `没有可写回的文件：${plan.skipped.map(item => `${item.relPath}（${item.reason}）`).join('；')}`
+            : '没有需要写回的文件。');
+        return;
+    }
+
+    hideProgress();
+
+    const confirmed = await openWritebackModal(plan, job.directoryHandle, job);
+
+    if (!confirmed) {
+        showStatusMessage('已取消写回，原文件夹没有被改动。', false);
+        return;
+    }
+
+    const result = await executeFolderPlan(plan, job);
+    const parts = [`已写入 ${result.writtenCount} 个文件`];
+
+    if (result.unchangedCount) parts.push(`${result.unchangedCount} 个内容相同已跳过`);
+    if (plan.deletes.length) parts.push(`删除了 ${plan.deletes.length - result.failedDeletes.length} 个源文件`);
+    if (plan.skipped.length) parts.push(`跳过 ${plan.skipped.length} 个重名输出`);
+
+    const problems = result.warnings.concat(result.failedDeletes);
+
+    if (problems.length) {
+        showStatusMessage(`${parts.join('，')}；但有 ${problems.length} 项失败：${problems.join('；')}`);
+    } else {
+        showStatusMessage(`${parts.join('，')}。已写回「${job.directoryHandle.name || ''}」。`, false);
+    }
 }

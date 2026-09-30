@@ -3,7 +3,13 @@ body {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
 }
-#file-input-direct, #file-input-zip { display: none; }
+#file-input-direct, #file-input-zip, #file-input-folder { display: none; }
+.folder-drop { outline: none; }
+.folder-drop:focus-visible {
+    border-color: #3B82F6;
+    box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.25);
+}
+.folder-drop.readonly { border-style: solid; }
 .drop-zone.dragover {
     transform: scale(1.02);
     box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.4);
@@ -62,4 +68,62 @@ body {
 }
 .image-thumb-wrapper.selected .cover-check {
     display: block;
+}
+
+/* 写回确认弹窗 */
+.modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background: rgba(17, 24, 39, 0.55);
+}
+.modal-backdrop.hidden { display: none; }
+.modal-card {
+    width: 100%;
+    max-width: 34rem;
+    max-height: 85vh;
+    overflow-y: auto;
+    background: #fff;
+    border-radius: 1rem;
+    padding: 1.5rem;
+    box-shadow: 0 20px 45px rgba(17, 24, 39, 0.25);
+    animation: fadeIn 0.2s ease-out;
+}
+
+/* 写回清单的小标题与文件名列表 */
+.writeback-heading {
+    font-size: 0.875rem;
+    font-weight: 600;
+    margin-top: 0.75rem;
+}
+.writeback-heading.is-new { color: #15803D; }
+.writeback-heading.is-overwrite { color: #B45309; }
+.writeback-heading.is-delete { color: #B91C1C; }
+.writeback-heading.is-skip { color: #4B5563; }
+.writeback-list {
+    margin-top: 0.25rem;
+    padding-left: 0.1rem;
+    list-style: none;
+    font-size: 0.75rem;
+    color: #4B5563;
+}
+.writeback-list li {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    padding: 0.15rem 0;
+    overflow-wrap: anywhere;
+}
+.writeback-list li .writeback-size { color: #9CA3AF; }
+.path-badge {
+    display: inline-block;
+    max-width: 100%;
+    padding: 0 0.35rem;
+    border-radius: 0.375rem;
+    font-size: 0.7rem;
+    background: #EFF6FF;
+    color: #1D4ED8;
+    overflow-wrap: anywhere;
 }
