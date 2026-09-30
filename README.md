@@ -128,7 +128,7 @@ tests/browser-e2e.js     — 真实浏览器端到端测试（需要本机 Chrom
 
 ```bash
 node tests/wav-to-mp3.test.js   # 19 项：解析、位深、重采样、码率收敛、MP3 帧头
-node tests/browser-e2e.js       # 160 项：真实 Chrome 驱动页面，含真实下载解包、ID3 标签、RJ 联动（mock）、
+node tests/browser-e2e.js       # 164 项：真实 Chrome 驱动页面，含真实下载解包、ID3 标签、RJ 联动（mock）、
                                 #         文件夹扫描与写回原路径、写回确认清单、剪掉源文件、内容没变跳过、
                                 #         平铺（整树展开 + 移动文件 + 清理空目录，真假句柄各跑一遍）、
                                 #         只读降级、Firefox/Safari 降级入口、拖动文件夹、

@@ -4,7 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VTT to LRC 转换工具</title>
-    <link rel="stylesheet" href="styles.css">
+    <!--
+        本地资源的 ?v= 是缓存破坏用的，必须和页脚版本号一致：
+        GitHub Pages 给这些文件发 Cache-Control: max-age=600，改了代码但浏览器
+        还在跑缓存里的旧 JS，会出现"代码明明修好了、用户还在报旧错误"的情况。
+        改版本号时记得把这里和页脚一起改（端到端测试会校验两者一致）。
+    -->
+    <link rel="stylesheet" href="styles.css?v=1.9.1">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <!-- lamejs：LAME 的 JS 移植，用于把 WAV 转码成 320 kbps 的 MP3（主源失败时自动切备用源） -->
@@ -157,7 +163,7 @@
                     <span>GitHub · sulfide2085/vtt-to-lrc</span>
                 </a>
             </div>
-            <div>v1.9.0</div>
+            <div>v1.9.1</div>
         </footer>
     </div>
 
@@ -181,9 +187,9 @@
         </div>
     </div>
 
-    <script src="audio.js"></script>
-    <script src="folder.js"></script>
-    <script src="app.js"></script>
+    <script src="audio.js?v=1.9.1"></script>
+    <script src="folder.js?v=1.9.1"></script>
+    <script src="app.js?v=1.9.1"></script>
 
     <!--
         访问统计：GoatCounter

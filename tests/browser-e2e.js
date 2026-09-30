@@ -643,7 +643,31 @@ async function main() {
                 link.getAttribute('target') === '_blank' &&
                 link.textContent.includes('vtt-to-lrc');
         })()`));
-        check('页脚版本号与当前发布版一致（v1.9.0）', await evaluate(pageCdp, `document.querySelector('footer').textContent.includes('v1.9.0')`));
+        // 版本号双职责：既是发布标记，也是本地资源的缓存破坏参数。
+        // GitHub Pages 发 Cache-Control: max-age=600，如果 ?v= 没跟着版本走，
+        // 用户改了代码后仍会跑到缓存里的旧 JS（真实踩过：修好的删除逻辑被旧脚本复现成"18 项失败"）。
+        const versionInfo = await evaluate(pageCdp, `(() => {
+            const version = (document.querySelector('footer').textContent.match(/v(\\d+\\.\\d+\\.\\d+)/) || [])[1] || null;
+            const assets = [
+                document.querySelector('link[rel="stylesheet"][href^="styles.css"]'),
+                document.querySelector('script[src^="audio.js"]'),
+                document.querySelector('script[src^="folder.js"]'),
+                document.querySelector('script[src^="app.js"]')
+            ].filter(Boolean).map(el => el.getAttribute('href') || el.getAttribute('src'));
+
+            return {
+                version,
+                assets,
+                counts: document.querySelectorAll('link[rel="stylesheet"][href^="styles.css"], script[src^="audio.js"], script[src^="folder.js"], script[src^="app.js"]').length
+            };
+        })()`);
+
+        check(`页脚版本号是合法版本（读到 ${versionInfo.version}）`, /^\d+\.\d+\.\d+$/.test(String(versionInfo.version)), JSON.stringify(versionInfo));
+        check(
+            `本地资源都带上了匹配的缓存破坏参数（?v=${versionInfo.version}）`,
+            versionInfo.counts === 4 && versionInfo.assets.every(url => url.includes(`?v=${versionInfo.version}`)),
+            JSON.stringify(versionInfo.assets)
+        );
 
         // --- 2. ZIP 模式：真实点击 + 真实下载，并把下载到的压缩包拆开检查 ---
         console.log('\n[2] ZIP 模式（真实点击 + 真实下载，解包校验内容）');
