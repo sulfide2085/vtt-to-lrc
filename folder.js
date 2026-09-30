@@ -317,6 +317,48 @@
     }
 
     /**
+     * 删掉一个子目录，删之前重新确认它真的是空的。
+     *
+     * 只看规划时的清单不够：目录里可能还有扫描时被忽略的文件（txt、字幕之外的
+     * 任何东西），那些文件不在清单里，却实实在在占着目录。写盘之后重新列一遍
+     * 是最可靠的判断。
+     *
+     * 返回 true 表示目录已经不存在（删掉了，或本来就没有）。
+     */
+    async function deleteDirectoryIfEmpty(rootHandle, relPath) {
+        const parts = String(relPath).split(/[\\/]/).filter(Boolean);
+
+        if (parts.length === 0) return false;
+
+        const dirName = parts.pop();
+        let parent = rootHandle;
+
+        try {
+            for (const part of parts) {
+                parent = await parent.getDirectoryHandle(part, { create: false });
+            }
+
+            const directory = await parent.getDirectoryHandle(dirName, { create: false });
+            const names = [];
+
+            for await (const child of directory.values()) {
+                names.push(child.name);
+            }
+
+            if (names.length > 0) return false;
+
+            await parent.removeEntry(dirName);
+
+            return true;
+        } catch (error) {
+            // 目录已经不存在 = 目标状态已达成；其它错误（非空 / 权限）照实抛出
+            if (error && error.name === 'NotFoundError') return true;
+
+            throw error;
+        }
+    }
+
+    /**
      * 用 File 对象建一个只读目录句柄。
      * 降级路径（<input webkitdirectory>）已经拿到了完整 File 列表，
      * 这里包一层让后面扫描/转换代码不用写两套分支——只是写入会被拒绝。
@@ -405,6 +447,7 @@
         writeFile,
         readFile,
         deleteFile,
+        deleteDirectoryIfEmpty,
         handleFromFiles,
         toBytes
     };

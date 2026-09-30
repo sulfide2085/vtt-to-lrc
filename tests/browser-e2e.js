@@ -452,7 +452,14 @@ function makeFakeDirectoryTree(rootName, spec) {
                     return;
                 }
 
-                if (node.dirs.delete(name)) {
+                if (node.dirs.has(name)) {
+                    // 真实 API 删空目录时不需要 recursive；这里跟页面代码保持一致，
+                    // 只在目录真的空了才允许删，顺便把"删了非空目录"这种情况暴露成错误
+                    if (node.dirs.get(name).files.size > 0 || node.dirs.get(name).dirs.size > 0) {
+                        throw new DOMException('目录非空', 'InvalidModificationError');
+                    }
+
+                    node.dirs.delete(name);
                     logs.push('rmdir ' + (prefix ? prefix + '/' + name : name));
                     return;
                 }
@@ -582,7 +589,7 @@ async function main() {
         await pageCdp.send('Runtime.enable');
         await pageCdp.send('Log.enable');
         pageCdp.on('Log.entryAdded', params => {
-            if (params.entry.level === 'error' || /debug/.test(params.entry.text)) {
+            if (params.entry.level === 'error') {
                 console.log(`    [页面控制台] ${params.entry.text}`);
             }
         });
@@ -1641,8 +1648,9 @@ async function main() {
                 const listAfter = handle.list().sort();
                 const lrcStems = listAfter.filter(name => name.endsWith('.lrc')).map(name => name.replace(/\\.lrc$/, ''));
                 const mp3Stems = listAfter.filter(name => name.endsWith('.mp3')).map(name => name.replace(/\\.mp3$/, ''));
-                const sourcesIntact = ['作品A/歌曲.wav', '作品B/歌曲.wav', '作品A/歌曲.wav.vtt', '作品B/歌曲.wav.vtt']
-                    .every(relPath => handle.has(relPath));
+                // 平铺是"搬"而不是"复制"：源文件应当已经不在子目录里了
+                const sourcesMoved = ['作品A/歌曲.wav', '作品B/歌曲.wav', '作品A/歌曲.wav.vtt', '作品B/歌曲.wav.vtt']
+                    .every(relPath => !handle.has(relPath));
 
                 return {
                     flattenWarning: summaryText.includes('平铺'),
@@ -1652,7 +1660,7 @@ async function main() {
                     lrcStems,
                     mp3Stems,
                     paired: lrcStems.length === 2 && lrcStems.every(stem => mp3Stems.includes(stem)),
-                    sourcesIntact,
+                    sourcesMoved,
                     status: document.getElementById('status-message').textContent
                 };
             } finally {
@@ -1669,12 +1677,117 @@ async function main() {
             JSON.stringify(flattenResult.listAfter)
         );
         check('本次没有真重名，跳过列表为空', flattenResult.skipped.length === 0, JSON.stringify(flattenResult.skipped));
-        check('平铺不会删掉源文件', flattenResult.sourcesIntact === true, JSON.stringify(flattenResult.listAfter));
+        check('平铺后源文件已从子目录搬走（不是复制一份）', flattenResult.sourcesMoved === true, JSON.stringify(flattenResult.listAfter));
 
-        // --- 19. 文件夹模式：Firefox / Safari 的降级入口 ---
+        // --- 19. 文件夹模式：平铺后被搬空的子目录要一起收掉 ---
+        // 用户真实反馈：平铺后 MP3 跑到根目录了，原来的子文件夹还留在原地，
+        // 和压缩包模式的平铺不一致。这里要求"清空后变空"的子目录一起删掉。
+        console.log('\n[19] 文件夹模式：平铺后清理被搬空的子目录');
+
+        const flattenCleanupResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+
+            const handle = makeFakeDirectoryTree('RJ324692_测试作品', {
+                '第一話/01.wav': makeTestWav({ frames: 11025, freq: 440 }),
+                '第一話/01.wav.vtt': 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n第一话台词\\n',
+                '第二話/02.wav': makeTestWav({ frames: 11025, freq: 660 }),
+                '第二話/02.wav.vtt': 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n第二话台词\\n',
+                '封面.jpg': new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 16, 74, 70, 73, 70, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0])
+            });
+
+            window.__vttTestDirectoryProvider = async () => handle;
+
+            try {
+                switchTab('folder');
+                document.getElementById('folder-transcode-wav-checkbox').checked = true;
+                document.getElementById('folder-flatten-checkbox').checked = true;
+
+                await pickSourceFolder();
+
+                const running = convertAndDownload();
+
+                for (let i = 0; i < 200 && document.getElementById('writeback-modal').classList.contains('hidden'); i++) {
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                }
+
+                const cleanupListed = [...document.querySelectorAll('#writeback-summary .writeback-heading.is-rmdir + .writeback-list li')].map(el => el.textContent);
+                const summaryText = document.getElementById('writeback-summary').textContent;
+
+                document.getElementById('writeback-confirm').click();
+                await running;
+
+                return {
+                    cleanupListed,
+                    mentionsEmptyDirs: summaryText.includes('清理空目录') && summaryText.includes('删除前会再确认一次'),
+                    listAfter: handle.list().sort(),
+                    rmdirLogs: handle.logs.filter(line => line.startsWith('rmdir')),
+                    status: document.getElementById('status-message').textContent
+                };
+            } finally {
+                delete window.__vttTestDirectoryProvider;
+                document.getElementById('folder-flatten-checkbox').checked = false;
+            }
+        })()`);
+
+        check('确认清单里预告会清理空目录', sameSet(flattenCleanupResult.cleanupListed, ['第一話', '第二話']) && flattenCleanupResult.mentionsEmptyDirs === true, JSON.stringify(flattenCleanupResult.cleanupListed));        check('平铺把源文件搬走，子目录被删干净（只剩根目录文件）', sameSet(flattenCleanupResult.listAfter, ['01.lrc', '01.mp3', '02.lrc', '02.mp3', '封面.jpg']), JSON.stringify(flattenCleanupResult.listAfter));
+        check('删除的是目录而不是文件', sameSet(flattenCleanupResult.rmdirLogs, ['rmdir 第一話', 'rmdir 第二話']), JSON.stringify(flattenCleanupResult.rmdirLogs));
+        check('完成后汇报清理数量', (flattenCleanupResult.status || '').includes('清理了 2 个空目录'), flattenCleanupResult.status);
+
+        // --- 20. 文件夹模式：子目录里还有用户文件时不能删 ---
+        console.log('\n[20] 文件夹模式：平铺时保留仍有文件的子目录');
+
+        const flattenKeepResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+
+            const handle = makeFakeDirectoryTree('保留测试', {
+                '第一話/01.wav': makeTestWav({ frames: 11025 }),
+                '第一話/01.wav.vtt': 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n台词\\n',
+                '第一話/说明.txt': '用户自己的笔记，不能被删'
+            });
+
+            window.__vttTestDirectoryProvider = async () => handle;
+
+            try {
+                switchTab('folder');
+                document.getElementById('folder-transcode-wav-checkbox').checked = true;
+                document.getElementById('folder-flatten-checkbox').checked = true;
+
+                await pickSourceFolder();
+
+                const running = convertAndDownload();
+
+                for (let i = 0; i < 200 && document.getElementById('writeback-modal').classList.contains('hidden'); i++) {
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                }
+
+                const cleanupListed = [...document.querySelectorAll('#writeback-summary .writeback-heading.is-rmdir + .writeback-list li')].map(el => el.textContent);
+
+                document.getElementById('writeback-confirm').click();
+                await running;
+
+                return {
+                    cleanupListed,
+                    listAfter: handle.list().sort(),
+                    noteText: handle.text('第一話/说明.txt'),
+                    rmdirLogs: handle.logs.filter(line => line.startsWith('rmdir')),
+                    status: document.getElementById('status-message').textContent
+                };
+            } finally {
+                delete window.__vttTestDirectoryProvider;
+                document.getElementById('folder-flatten-checkbox').checked = false;
+            }
+        })()`);
+
+        check('该子目录被列为清理候选', sameSet(flattenKeepResult.cleanupListed, ['第一話']), JSON.stringify(flattenKeepResult.cleanupListed));
+        check('但删之前发现它还有文件，于是没有删', flattenKeepResult.rmdirLogs.length === 0, JSON.stringify(flattenKeepResult.rmdirLogs));
+        check('该子目录连同用户文件一起保留', flattenKeepResult.listAfter.includes('第一話/说明.txt') && flattenKeepResult.noteText === '用户自己的笔记，不能被删', JSON.stringify(flattenKeepResult.listAfter));
+        check('平铺的成果仍然落在根目录', flattenKeepResult.listAfter.includes('01.mp3') && flattenKeepResult.listAfter.includes('01.lrc'), JSON.stringify(flattenKeepResult.listAfter));
+        check('汇报里不会虚报清理数量', !(flattenKeepResult.status || '').includes('清理了'), flattenKeepResult.status);
+
+        // --- 21. 文件夹模式：Firefox / Safari 的降级入口 ---
         // 这两个浏览器没有 showDirectoryPicker，点按钮应该直接走 <input webkitdirectory>，
         // 并且在页面上说明"只能读、结果打包下载"，而不是报错或没反应。
-        console.log('\n[19] 文件夹模式：不支持写入时的降级入口');
+        console.log('\n[21] 文件夹模式：不支持写入时的降级入口');
 
         const degradeEntryResult = await evaluate(pageCdp, `(async () => {
             const originalIsSupported = FolderFs.isSupported;
@@ -1755,10 +1868,10 @@ async function main() {
         check('降级后仍能正常读入并转换', degradeEntryResult.count === 2 && degradeEntryResult.sourceKind === 'folder', JSON.stringify(degradeEntryResult));        check('降级路径不可写', degradeEntryResult.writable === false);
         check('降级输出为 LRC 打包下载', sameSet(degradeEntryResult.names, ['第一話.lrc', '第二話.lrc']) && degradeEntryResult.downloadName === '作品_after.zip', JSON.stringify(degradeEntryResult));
 
-        // --- 20. 文件夹模式：目录选择器失败时必须自动降级 ---
+        // --- 22. 文件夹模式：目录选择器失败时必须自动降级 ---
         // 线上真实反馈"点了没反应"：showDirectoryPicker() 在缺少用户激活 / 权限被拒 /
         // 系统不支持时会抛错，旧代码只弹一行报错就结束，用户看到的就是点了没动静。
-        console.log('\n[20] 文件夹模式：目录选择器失败后自动降级');
+        console.log('\n[22] 文件夹模式：目录选择器失败后自动降级');
 
         const pickerFailResult = await evaluate(pageCdp, `(async () => {
             const makeFile = (relativePath, text) => {
@@ -1822,8 +1935,8 @@ async function main() {
         check('降级后按钮文案变成打包下载', pickerFailResult.buttonLabel === '转换并下载 ZIP', pickerFailResult.buttonLabel);
         check('降级后仍能正常转换', sameSet(pickerFailResult.names, ['第一話.lrc', '第二話.lrc']), JSON.stringify(pickerFailResult.names));
 
-        // --- 21. 文件夹模式：<input webkitdirectory> 的路径还原 ---
-        console.log('\n[21] 文件夹模式：webkitdirectory 的目录层级还原');
+        // --- 23. 文件夹模式：<input webkitdirectory> 的路径还原 ---
+        console.log('\n[23] 文件夹模式：webkitdirectory 的目录层级还原');
 
         const degradeResult = await evaluate(pageCdp, `(async () => {
             const makeFile = (relativePath, text) => {
@@ -1867,11 +1980,11 @@ async function main() {
         check('保留目录结构输出 LRC', JSON.stringify(degradeResult.names) === JSON.stringify(['第一話.lrc', '第二話.lrc']), JSON.stringify(degradeResult.names));
         check('降级路径的 LRC 内容正确', JSON.stringify(degradeResult.contents) === JSON.stringify([['第一話.lrc', '[00:00.00]降级路径\n'], ['第二話.lrc', '[00:02.00]第二句\n']]), JSON.stringify(degradeResult.contents));
 
-        // --- 21. 文件夹模式：把文件夹拖进来 ---
+        // --- 24. 文件夹模式：把文件夹拖进来 ---
         // 真实拖拽事件 CDP 没法伪造出 FileSystemDirectoryEntry，所以这里只伪造
         // DataTransfer 的形状（items[0].webkitGetAsEntry() → 目录 entry → entry.handle），
         // 页面里的 handleFolderDrop 逻辑是原封不动跑的。
-        console.log('\n[21] 文件夹模式：拖拽文件夹进入');
+        console.log('\n[24] 文件夹模式：拖拽文件夹进入');
 
         const dropResult = await evaluate(pageCdp, `(async () => {
             ${MAKE_WAV_SOURCE}
@@ -1921,11 +2034,11 @@ async function main() {
         check('拖入的目录被扫描出 VTT', dropResult.count === 1, `识别到 ${dropResult.count} 个`);
         check('拖入的目录能正常转换', sameSet(dropResult.names, ['第一話/01.lrc', '第一話/01.mp3']), JSON.stringify(dropResult.names));
 
-        // --- 22. 文件夹模式：用真实 File System Access 句柄跑一遍 ---
+        // --- 25. 文件夹模式：用真实 File System Access 句柄跑一遍 ---
         // 前面的用例用的是内存假目录；这一节改用 OPFS（源私有文件系统）拿到的
         // 真 FileSystemDirectoryHandle / FileSystemWritableFileStream，
         // 检验真实浏览器 API 的调用方式（values() 递归、createWritable、removeEntry）没问题。
-        console.log('\n[22] 文件夹模式：真实 File System Access 句柄（OPFS）');
+        console.log('\n[25] 文件夹模式：真实 File System Access 句柄（OPFS）');
 
         const opfsResult = await evaluate(pageCdp, `(async () => {
             ${MAKE_WAV_SOURCE}
@@ -2035,10 +2148,10 @@ async function main() {
             check('普通文件在真实目录里未被改动', opfsResult.noteText === '真实目录里的普通文件', opfsResult.noteText);
         }
 
-        // --- 23. 访问统计（GoatCounter）只在线上真的生效 ---
+        // --- 26. 访问统计（GoatCounter）只在线上真的生效 ---
         // 线上必须发出 /count 请求，否则统计数据会静默丢失；
         // 本地 file:// 则必须不发，避免开发时污染线上数据。
-        console.log('\n[23] 访问统计（GoatCounter）');
+        console.log('\n[26] 访问统计（GoatCounter）');
 
         await pageCdp.send('Network.enable');
 

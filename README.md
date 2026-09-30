@@ -46,7 +46,9 @@ python -m http.server 8080
 | 图片 / 其它文件 | 一个都不动 |
 
 - **剪掉源文件**：勾选后，转码成功才删除原 WAV 与已转成 LRC 的 VTT（不可撤销；清单里会先用红字列出来）
-- **平铺**：把结果平铺到所选文件夹根目录，重名自动加路径前缀；不会为了消重名而删掉源文件
+- **平铺**：把结果平铺到所选文件夹根目录。和上面一样是**移动**而不是复制——源文件由根目录的版本取代，
+  被搬空的子目录会一起清理掉（删之前会再确认一次目录是空的，里面还有别的文件就保留）。
+  重名时自动加路径前缀；不会为了消重名而删掉源文件
 - **内容没变不重写**：LRC / 封面内容与现有文件一致时直接跳过，不动文件时间戳
 - **权限**：浏览器会为这个文件夹授权；如果写入时报权限错误，重新点一次「选择文件夹」再确认即可
 - **兼容性**：Chrome / Edge 支持完整读写；Firefox / Safari 没有 File System Access API，
@@ -121,10 +123,10 @@ tests/browser-e2e.js     — 真实浏览器端到端测试（需要本机 Chrom
 
 ```bash
 node tests/wav-to-mp3.test.js   # 19 项：解析、位深、重采样、码率收敛、MP3 帧头
-node tests/browser-e2e.js       # 139 项：真实 Chrome 驱动页面，含真实下载解包、ID3 标签、RJ 联动（mock）、
+node tests/browser-e2e.js       # 152 项：真实 Chrome 驱动页面，含真实下载解包、ID3 标签、RJ 联动（mock）、
                                 #         文件夹扫描与写回原路径、写回确认清单、剪掉源文件、内容没变跳过、
-                                #         只读降级、Firefox/Safari 降级入口、平铺配对、拖动文件夹、
-                                #         真实 File System Access 句柄、中途切标签、窄屏点击
+                                #         平铺（移动源文件 + 清理空目录）、只读降级、Firefox/Safari 降级入口、
+                                #         拖动文件夹、真实 File System Access 句柄、中途切标签、窄屏点击
 
 # 也可以直接测线上站点（部署后冒烟验证）
 node tests/browser-e2e.js https://sulfide2085.github.io/vtt-to-lrc/

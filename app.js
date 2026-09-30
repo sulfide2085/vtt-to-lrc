@@ -2295,13 +2295,105 @@ async function listChildNames(directoryHandle) {
 }
 
 /**
+ * 平铺后哪些目录会变空、可以删掉。
+ *
+ * 平铺会把子目录里的文件搬到根目录，搬完原地就只剩空壳子目录——用户看到的是
+ * "文件跑到根目录了，原来的文件夹还杵在那"，和压缩包模式的平铺不一致。
+ * 这里只删"清空后变空、且子孙目录也全都会变空"的目录：只要某个目录（或它的
+ * 任意子目录）里还剩一个不属于本次操作的文件，整条链都不会被删。
+ *
+ * 判定用的是操作开始时的清单 + 本次的写入/删除记录，不去读文件系统，
+ * 因此没有"先检查后删"之间被塞进文件进来的竞态。
+ */
+function removableDirectoriesAfterFlatten(job, targets) {
+    const counts = new Map([['', { files: 0, dirs: 0 }]]);
+
+    function ensure(relativeDir) {
+        const existing = counts.get(relativeDir);
+
+        if (existing) return existing;
+
+        const slashIndex = relativeDir.lastIndexOf('/');
+        const parent = slashIndex > 0 ? relativeDir.slice(0, slashIndex) : "";
+        const created = { files: 0, dirs: 0 };
+
+        counts.set(relativeDir, created);
+        ensure(parent).dirs++;
+
+        return created;
+    }
+
+    function directoryOf(relativePath) {
+        const parts = String(relativePath).split('/').filter(Boolean);
+
+        parts.pop();
+
+        return { dir: parts.join('/'), parts };
+    }
+
+    // 起点：操作前目录里有什么
+    for (const file of job.directoryFiles || []) {
+        ensure(directoryOf(file.relPath).dir).files++;
+    }
+
+    for (const target of targets) {
+        // 源文件被移走（原目录少一个文件）
+        ensure(directoryOf(target.source.relPath).dir).files--;
+
+        // 结果落到哪个目录（根目录不再单独计数，反正根目录永不删）
+        const destination = directoryOf(target.relPath).dir;
+
+        if (destination) ensure(destination).files++;
+    }
+
+    return emptyDirectoryChain(counts, '').dirs;
+}
+
+/** 返回「清空后变空」的目录，子目录排在父目录前面，正好是删除顺序 */
+function emptyDirectoryChain(counts, relativeDir) {
+    const children = [];
+
+    for (const candidate of counts.keys()) {
+        if (!candidate || candidate === relativeDir) continue;
+
+        const slashIndex = candidate.lastIndexOf('/');
+        const parent = slashIndex > 0 ? candidate.slice(0, slashIndex) : '';
+
+        if (parent === relativeDir) children.push(candidate);
+    }
+
+    const removable = [];
+    // 根目录本身永不删，但它的"空"取决于所有子目录是否都空
+    let allEmpty = relativeDir === '' ? counts.get('').files === 0 : counts.get(relativeDir).files === 0;
+
+    for (const child of children) {
+        const childResult = emptyDirectoryChain(counts, child);
+
+        removable.push(...childResult.dirs);
+        allEmpty = allEmpty && childResult.empty;
+    }
+
+    const dirs = relativeDir !== '' && allEmpty ? removable.concat(relativeDir) : removable;
+
+    return { empty: allEmpty, dirs };
+}
+
+/**
  * 先把要做的每一件事算清楚（写什么、覆盖谁、删什么），
  * 再去执行。规划与执行严格分开，确认弹窗里显示的清单就是真正会发生的操作。
  */
 async function planFolderWrites(entries, job) {
     const targets = [];
     const skipped = [];
-    const plan = { writes: [], newFiles: [], overwrites: [], deletes: [], skipped };
+    const plan = { writes: [], newFiles: [], overwrites: [], deletes: [], removeDirs: [], skipped };
+
+    /**
+     * 平铺是把文件"搬"到根目录，不是复制一份：新位置写好后必须收掉原位置的旧文件，
+     * 否则根目录和子目录各留一份，体积翻倍，用户看到的就是"根本没展开"。
+     */
+    const flattenMovesSource = entry => (
+        job.shouldFlatten && entry.outputName !== entry.relPath
+    );
 
     for (const entry of entries) {
         const outputName = entry.outputName;
@@ -2312,8 +2404,9 @@ async function planFolderWrites(entries, job) {
                 source: entry,
                 typeLabel: 'LRC',
                 build: async () => convertVttToLrc(await entry.getText()),
-                // 勾了"剪掉源文件"就顺手删掉 VTT——和 ZIP 模式的输出一致（输出包里不会有 VTT）
-                deleteSource: job.shouldDeleteSource ? entry.relPath : null
+                // 勾了"剪掉源文件"就顺手删掉 VTT——和 ZIP 模式的输出一致（输出包里不会有 VTT）；
+                // 平铺时源 VTT 同样被搬到根目录的 LRC 取代
+                deleteSource: job.shouldDeleteSource || flattenMovesSource(entry) ? entry.relPath : null
             });
 
             continue;
@@ -2333,7 +2426,7 @@ async function planFolderWrites(entries, job) {
                         `转码 WAV ${entry.name} — ${message || ''}`
                     )
                 }),
-                deleteSource: job.shouldDeleteSource ? entry.relPath : null
+                deleteSource: job.shouldDeleteSource || flattenMovesSource(entry) ? entry.relPath : null
             });
 
             continue;
@@ -2350,11 +2443,11 @@ async function planFolderWrites(entries, job) {
                     job.coverImage.mime,
                     buildTrackMetadata(job.work, entry.name.replace(/\.[^.]+$/, ''))
                 ),
-                deleteSource: null
+                deleteSource: flattenMovesSource(entry) ? entry.relPath : null
             });
         }
 
-        // 图片和其它文件一律不动
+        // 其它文件（图片、文档…）一律不动：平铺只搬本次处理过的文件
     }
 
     // 同名目标只处理一次，例如「歌曲.wav」（转码成 歌曲.mp3）撞上本来就有的「歌曲.mp3」
@@ -2394,6 +2487,14 @@ async function planFolderWrites(entries, job) {
 
     plan.deletes = [...deletionSet];
 
+    // 平铺模式：把被搬空的子目录一起收掉，否则会出现"文件在根目录、空文件夹留在原地"
+    if (job.shouldFlatten) {
+        plan.removeDirs = removableDirectoriesAfterFlatten(job, plan.writes);
+        plan.flatHint = '（转码成功后执行，不可撤销；平铺时源文件由根目录的版本取代）';
+    } else {
+        plan.flatHint = '（转码成功后执行，不可撤销）';
+    }
+
     return plan;
 }
 
@@ -2418,8 +2519,8 @@ function buildWritebackSummary(plan, handle) {
 
     block('新增文件', plan.newFiles, 'is-new');
     block('覆盖原文件', plan.overwrites, 'is-overwrite', '（原内容会被替换）');
-    block('删除源文件', plan.deletes, 'is-delete', '（转码成功后执行，不可撤销）');
-    block('跳过', plan.skipped.map(item => `${item.relPath} ← ${item.reason}`), 'is-skip');
+    block('删除源文件', plan.deletes, 'is-delete', plan.flatHint);
+    block('清理空目录', plan.removeDirs || [], 'is-rmdir', '（平铺后变空的子目录；删除前会再确认一次，目录里还有文件就保留）');    block('跳过', plan.skipped.map(item => `${item.relPath} ← ${item.reason}`), 'is-skip');
 
     const totalBytes = plan.writes
         .map(target => target.source.size)
@@ -2476,6 +2577,7 @@ async function executeFolderPlan(plan, job) {
     const handle = job.directoryHandle;
     const warnings = [];
     const failedDeletes = [];
+    const failedDirs = [];
     let writtenCount = 0;
     let unchangedCount = 0;
 
@@ -2516,7 +2618,28 @@ async function executeFolderPlan(plan, job) {
         }
     }
 
-    return { writtenCount, unchangedCount, warnings, failedDeletes };
+    // 最后收掉被搬空的子目录。
+    // 计划的清单只是"候选"，真正删之前由 FolderFs.deleteDirectoryIfEmpty 重新确认目录是空的：
+    // 目录里可能还剩扫描时被忽略的文件（txt 之类），删之前再列一遍才不会误删。
+    const removedDirs = [];
+    const skippedDirs = [];
+
+    for (const relPath of plan.removeDirs || []) {
+        try {
+            setProgress(0.99, `清理空目录 ${relPath}`);
+
+            if (await FolderFs.deleteDirectoryIfEmpty(handle, relPath)) {
+                removedDirs.push(relPath);
+            } else {
+                skippedDirs.push(relPath);
+            }
+        } catch (error) {
+            console.error(`删除空目录失败：${relPath}`, error);
+            failedDirs.push(`${relPath}（${error.message}）`);
+        }
+    }
+
+    return { writtenCount, unchangedCount, warnings, failedDeletes, failedDirs, removedDirs, skippedDirs };
 }
 
 function readExistingDigest(handle, relPath) {
@@ -2559,9 +2682,10 @@ async function processFolderWriteBack(job) {
 
     if (result.unchangedCount) parts.push(`${result.unchangedCount} 个内容相同已跳过`);
     if (plan.deletes.length) parts.push(`删除了 ${plan.deletes.length - result.failedDeletes.length} 个源文件`);
+    if (result.removedDirs.length) parts.push(`清理了 ${result.removedDirs.length} 个空目录`);
     if (plan.skipped.length) parts.push(`跳过 ${plan.skipped.length} 个重名输出`);
 
-    const problems = result.warnings.concat(result.failedDeletes);
+    const problems = result.warnings.concat(result.failedDeletes, result.failedDirs);
 
     if (problems.length) {
         showStatusMessage(`${parts.join('，')}；但有 ${problems.length} 项失败：${problems.join('；')}`);

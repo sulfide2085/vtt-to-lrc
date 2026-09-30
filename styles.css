@@ -103,6 +103,7 @@ body {
 .writeback-heading.is-new { color: #15803D; }
 .writeback-heading.is-overwrite { color: #B45309; }
 .writeback-heading.is-delete { color: #B91C1C; }
+.writeback-heading.is-rmdir { color: #B45309; }
 .writeback-heading.is-skip { color: #4B5563; }
 .writeback-list {
     margin-top: 0.25rem;
