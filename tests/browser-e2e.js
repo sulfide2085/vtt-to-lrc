@@ -1750,6 +1750,11 @@ async function main() {
         check('两个子目录里的同名 info.txt 都还在，内容各自保留', sameSet(flattenCleanupResult.infoTexts, ['第一话的说明', '第二话的说明']), JSON.stringify(flattenCleanupResult.infoTexts));
         check('删除的是目录而不是文件', sameSet(flattenCleanupResult.rmdirLogs, ['rmdir 第一話', 'rmdir 第二話']), JSON.stringify(flattenCleanupResult.rmdirLogs));
         check('汇报里带上清理数量与搬动数量', (flattenCleanupResult.status || '').includes('清理了 2 个空目录') && (flattenCleanupResult.status || '').includes('搬动 3 个原样保留的文件'), flattenCleanupResult.status);
+        // 回归：搬动过的源文件曾被删两次，第二次必然 NotFound，于是同一条路径既算"已删除"
+        // 又算"失败"，报告自相矛盾。搬动成功就该是干净的"0 失败"。
+        check('删源文件不会重复删除导致虚报失败', !(flattenCleanupResult.status || '').includes('失败'), flattenCleanupResult.status);
+        // 4 个转码/字幕源文件 + 3 个搬动文件 = 7 个原位置被清掉，且不该出现重复删除
+        check('删除数量与实际相符', (flattenCleanupResult.status || '').includes('删除了 7 个源文件'), flattenCleanupResult.status);
 
         // --- 20. 文件夹模式：清理空目录前必须重新确认真空 ---
         // 规划只看得到"扫描进来的文件"，而扫描会刻意跳过 node_modules 这类目录。
@@ -2263,6 +2268,7 @@ async function main() {
             check('真实句柄上 LRC 内容正确', opfsFlatten.lrcText === '[00:00.00]平铺台词\n', JSON.stringify(opfsFlatten.lrcText));
             check('真实句柄上普通文件被搬到根目录且内容不变', opfsFlatten.noteText === '子目录里的说明', String(opfsFlatten.noteText));
             check('真实句柄上如实汇报清理与搬动数量', (opfsFlatten.status || '').includes('清理了 1 个空目录') && (opfsFlatten.status || '').includes('搬动 1 个原样保留的文件'), opfsFlatten.status);
+            check('真实句柄上搬动不产生虚假失败', !(opfsFlatten.status || '').includes('失败'), opfsFlatten.status);
         }
 
         // --- 27. 访问统计（GoatCounter）只在线上真的生效 ---

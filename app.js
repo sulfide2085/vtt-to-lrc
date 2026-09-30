@@ -2428,7 +2428,9 @@ async function planFolderWrites(entries, job) {
     for (const entry of entries) {
         const outputName = entry.outputName;
 
-        // 平铺时原样保留的文件只是被搬到根目录：文件内容不变，写完新位置再删原位置
+        // 平铺时原样保留的文件只是被搬到根目录：文件内容不变，写完新位置再删原位置。
+        // 这里刻意不填 deleteSource：原位置的删除由 executeFolderPlan 在"确认复制成功"之后
+        // 统一处理，写进 plan.deletes 会导致同一个文件被删两次（第二次必然报 NotFound）。
         if (entry.movedAsIs) {
             targets.push({
                 relPath: outputName,
@@ -2436,7 +2438,7 @@ async function planFolderWrites(entries, job) {
                 typeLabel: '移动',
                 deleteOnly: true,
                 build: null,
-                deleteSource: entry.relPath
+                deleteSource: null
             });
 
             continue;
@@ -2529,9 +2531,11 @@ async function planFolderWrites(entries, job) {
         }
     });
 
-    for (const target of plan.writes.concat(plan.moves)) {
+    // plan.deletes 只装"因为被转码/转换而删掉"的源文件。
+    // 平铺搬动的文件不放这里——它们的原位置要等复制成功后才删，
+    // 由 executeFolderPlan 用 movedSources 处理；清单展示时再合并两边。
+    for (const target of plan.writes) {
         if (target.deleteSource && target.deleteSource !== target.relPath) {
-            // 去重：平铺时两个不同作品可能压到同一个输出名，但源文件只会被登记一次
             deletionSet.add(target.deleteSource);
         }
     }
@@ -2570,13 +2574,17 @@ function buildWritebackSummary(plan, handle) {
 
     block('新增文件', plan.newFiles, 'is-new');
     block('覆盖原文件', plan.overwrites, 'is-overwrite', '（原内容会被替换）');
-    block('删除源文件', plan.deletes, 'is-delete', plan.flatHint);
-    block('清理空目录', plan.removeDirs || [], 'is-rmdir', '（平铺后变空的子目录；删除前会再确认一次，目录里还有文件就保留）');    block('跳过', plan.skipped.map(item => `${item.relPath} ← ${item.reason}`), 'is-skip');
+    // 展示时把两边合并：转码/转换删掉的源文件 + 平铺搬走时被根目录版本取代的原文件
+    block('删除源文件', plan.deletes.concat((plan.moves || []).map(target => target.source.relPath)), 'is-delete', plan.flatHint);
+    block('清理空目录', plan.removeDirs || [], 'is-rmdir', '（平铺后变空的子目录；删除前会再确认一次，目录里还有文件就保留）');
+    block('跳过', plan.skipped.map(item => `${item.relPath} ← ${item.reason}`), 'is-skip');
 
-    const totalBytes = plan.writes
+    // 写入和搬动都要读源文件，一起算进"读取约"的估算里
+    const totalBytes = plan.writes.concat(plan.moves || [])
         .map(target => target.source.size)
         .filter(size => size > 0)
         .reduce((sum, size) => sum + size, 0);
+
 
     blocks.push(`
         <p class="text-xs text-gray-500 mt-3">
@@ -2692,6 +2700,12 @@ async function executeFolderPlan(plan, job) {
             await FolderFs.deleteFile(handle, relPath);
             deletedCount++;
         } catch (error) {
+            // 文件已经不在了 = 目标状态已达成，不该报成失败（重跑、或多条路径指向同一份文件时会遇到）
+            if (error && error.name === 'NotFoundError') {
+                deletedCount++;
+                continue;
+            }
+
             console.error(`删除失败：${relPath}`, error);
             failedDeletes.push(`${relPath}（${error.message}）`);
         }
