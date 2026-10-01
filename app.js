@@ -52,6 +52,8 @@ const folderOptions = document.getElementById('folder-options');
 const folderTranscodeCheckbox = document.getElementById('folder-transcode-wav-checkbox');
 const folderFlattenCheckbox = document.getElementById('folder-flatten-checkbox');
 const folderDeleteSourceCheckbox = document.getElementById('folder-delete-source-checkbox');
+const folderBatchCheckbox = document.getElementById('folder-batch-checkbox');
+const folderBatchCoverCheckbox = document.getElementById('folder-batch-cover-checkbox');
 const folderNote = document.getElementById('folder-note');
 const writebackModal = document.getElementById('writeback-modal');
 const writebackTitle = document.getElementById('writeback-title');
@@ -72,6 +74,8 @@ let zipWavCount = 0; // 包内 WAV 数量
 let isProcessing = false; // 正在转换中：禁止切标签/清空/换文件，避免打断正在跑的任务
 let currentWork = null; // 按 RJ 号查到的作品信息
 let folderStore = null; // { handle, canWrite, rootName } 文件夹模式的写回目标
+let folderTasks = []; // 批量：每个子文件夹（或每个拖进来的文件夹）一个任务
+let batchParentName = ''; // 批量来源（选中的父文件夹名）
 let folderScan = null; // { vttCount, wavCount, mp3Count, imageCount, otherCount, skippedDirs, truncated }
 let modalResolver = null; // 当前等待用户回答的弹窗
 let folderModeNotice = ''; // 目录选择器失败之类的重要提示，挂在文件夹状态行上常驻显示
@@ -410,6 +414,8 @@ function clearFiles() {
     currentWork = null;
     folderStore = null;
     folderScan = null;
+    folderTasks = [];
+    batchParentName = '';
 
     hideWorkInfo();
     closeWritebackModal();
@@ -451,6 +457,11 @@ function setButtonLoading(isLoading) {
  * 点下去却弹出写回清单，容易让人以为点错了。
  */
 function updateActionButtonLabel() {
+    if (folderTasks.length > 0) {
+        btnText.textContent = `转换并写回 ${folderTasks.length} 个文件夹`;
+        return;
+    }
+
     const isFolderMode = !!folderStore;
 
     btnText.textContent = isFolderMode && folderStore.canWrite
@@ -618,6 +629,12 @@ async function pickSourceFolder() {
         return;
     }
 
+    // 批量模式：选中的是父文件夹，把它下面的直接子文件夹各当作一个任务
+    if (folderBatchCheckbox.checked) {
+        await loadBatchTasksFromParent(picked.handle);
+        return;
+    }
+
     await scanFolderHandle(picked.handle, picked.canWrite);
 }
 
@@ -681,20 +698,18 @@ async function handleFolderDrop(dataTransfer) {
     }
 
     const items = dataTransfer && dataTransfer.items ? Array.from(dataTransfer.items) : [];
-    let directoryEntry = null;
+    const directoryEntries = [];
 
+    // 同步抓完所有 entry：DataTransferItem 在 await 之后就失效了
     for (const item of items) {
         if (item.kind !== 'file') continue;
 
         const entry = typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null;
 
-        if (entry && entry.isDirectory) {
-            directoryEntry = entry;
-            break;
-        }
+        if (entry && entry.isDirectory) directoryEntries.push(entry);
     }
 
-    if (!directoryEntry) {
+    if (directoryEntries.length === 0) {
         const fileCount = dataTransfer && dataTransfer.files ? dataTransfer.files.length : 0;
 
         showStatusMessage(fileCount
@@ -704,19 +719,35 @@ async function handleFolderDrop(dataTransfer) {
         return;
     }
 
-    let handle;
+    const handles = [];
 
-    try {
-        // 拿到的是 FileSystemDirectoryHandle，是否可写要等写的时候才知道
-        handle = await directoryEntry.handle;
-    } catch (error) {
-        console.error('读取拖入的文件夹失败:', error);
+    for (const entry of directoryEntries) {
+        try {
+            // 拿到的是 FileSystemDirectoryHandle，是否可写要等写的时候才知道
+            handles.push(await entry.handle);
+        } catch (error) {
+            console.error('读取拖入的文件夹失败:', error);
+        }
+    }
+
+    if (handles.length === 0) {
         showStatusMessage('读取拖入的文件夹失败，改用点击选择试试。');
         return;
     }
 
+    // 拖进来多个文件夹 = 多个任务（和"多次选单个文件夹"等价）
+    if (handles.length > 1) {
+        await loadBatchTasksFromHandles(handles, `拖入的 ${handles.length} 个文件夹`);
+        return;
+    }
+
+    if (folderBatchCheckbox.checked) {
+        await loadBatchTasksFromParent(handles[0]);
+        return;
+    }
+
     clearFiles();
-    await scanFolderHandle(handle, FolderFs.canWriteDirectory(handle));
+    await scanFolderHandle(handles[0], FolderFs.canWriteDirectory(handles[0]));
 }
 
 /** 扫描目录 → 填充文件列表 / 图片预览 / RJ 联动 */
@@ -815,6 +846,427 @@ function refreshFolderFileList() {
     if (!folderStore || !folderScan) return;
 
     updateFileListUI(folderScan.mp3Count > 0, folderScan.wavCount);
+}
+
+// --- 批量：多个文件夹 = 多个独立任务 ---
+
+const TASK_STATUS_LABELS = {
+    pending: '待处理',
+    planning: '规划中…',
+    planned: '待写回',
+    running: '写回中…',
+    done: '已完成',
+    partial: '部分失败',
+    failed: '失败',
+    skipped: '无需处理'
+};
+
+const TASK_STATUS_CLASSES = {
+    pending: 'text-gray-500',
+    planning: 'text-blue-600',
+    planned: 'text-blue-600',
+    running: 'text-blue-600',
+    done: 'text-green-600',
+    partial: 'text-amber-600',
+    failed: 'text-red-500',
+    skipped: 'text-gray-400'
+};
+
+/** 列出直接子文件夹（跳过 node_modules 这类），按名称自然排序 */
+async function listSubDirectories(parentHandle) {
+    const directoryNames = FolderFs.JUNK_DIRS;
+    const dirs = [];
+
+    try {
+        for await (const child of parentHandle.values()) {
+            if (child.kind !== 'directory') continue;
+            if (directoryNames.has(String(child.name).toLowerCase())) continue;
+
+            dirs.push(child);
+        }
+    } catch (error) {
+        console.error('列出子文件夹失败:', error);
+        throw new Error('无法列出这个文件夹的子目录，可能是权限不足。');
+    }
+
+    return dirs.sort((left, right) => String(left.name).localeCompare(String(right.name), 'zh-Hans-CN', { numeric: true }));
+}
+
+/** 批量模式：选中的父文件夹 → 每个直接子文件夹一个任务 */
+async function loadBatchTasksFromParent(parentHandle) {
+    clearFiles();
+
+    const parentName = String(parentHandle.name || '所选文件夹');
+    let subDirectories;
+
+    try {
+        subDirectories = await listSubDirectories(parentHandle);
+    } catch (error) {
+        showStatusMessage(error.message);
+        return;
+    }
+
+    if (subDirectories.length === 0) {
+        // 没有子文件夹就别硬套批量：按单个文件夹处理，别让用户白点一次
+        showStatusMessage(`「${parentName}」里没有子文件夹，已按单个文件夹处理。`, false);
+        await scanFolderHandle(parentHandle, FolderFs.canWriteDirectory(parentHandle));
+        return;
+    }
+
+    await loadBatchTasksFromHandles(subDirectories, parentName);
+}
+
+/** 每个文件夹一个任务。文件夹名会重新从扫描结果里取（拖拽进来的句柄同样有 name） */
+async function loadBatchTasksFromHandles(handles, parentName) {
+    clearFiles();
+
+    batchParentName = String(parentName || '');
+
+    folderTasks = handles.map(handle => ({
+        handle,
+        name: String(handle.name || '未命名文件夹'),
+        status: 'pending',
+        plan: null,
+        job: null,
+        files: null,
+        counts: null,
+        cover: null,
+        coverResolved: false,
+        work: null,
+        rj: findRjCodeIn(String(handle.name || '')),
+        rjError: null,
+        summary: '',
+        problems: [],
+        error: null
+    }));
+
+    renderBatchTaskList();
+
+    const noRj = folderTasks.filter(task => !task.rj).length;
+
+    showStatusMessage(noRj === folderTasks.length
+        ? `共 ${folderTasks.length} 个任务（文件夹名里都没找到 RJ 号，封面需要用「第一张图片」选项或手动处理）。`
+        : `共 ${folderTasks.length} 个任务，点「转换并写回」开始。`, false);
+}
+
+function setTaskStatus(task, status) {
+    task.status = status;
+    renderBatchTaskList();
+}
+
+function renderBatchTaskList() {
+    if (folderTasks.length === 0) return;
+
+    fileListTitle.textContent = `待处理任务（${folderTasks.length} 个文件夹${batchParentName ? ` · 来自「${batchParentName}」` : ''}）`;
+    fileList.innerHTML = '';
+
+    folderTasks.forEach((task, index) => {
+        const li = document.createElement('li');
+
+        li.className = 'list-item flex items-start justify-between gap-3 bg-gray-50 p-3 rounded-lg';
+        li.dataset.taskIndex = String(index);
+
+        const label = TASK_STATUS_LABELS[task.status] || task.status;
+        const statusClass = TASK_STATUS_CLASSES[task.status] || 'text-gray-500';
+        const safeName = escapeHtml(task.name);
+        const detail = escapeHtml(task.summary || task.error || '');
+
+        li.innerHTML = `
+            <div class="min-w-0">
+                <div class="text-sm font-medium text-gray-700 truncate" title="${safeName}">${safeName}</div>
+                ${detail ? `<div class="text-xs text-gray-500 mt-0.5 break-words">${detail}</div>` : ''}
+            </div>
+            <span class="text-sm shrink-0 ${statusClass}">${label}</span>
+        `;
+
+        fileList.appendChild(li);
+    });
+
+    fileListContainer.classList.remove('hidden');
+    actionButtons.classList.remove('hidden');
+
+    updateActionButtonLabel();
+}
+
+/** 批量里每个任务的封面：优先 RJ 元数据的封面，退而用文件夹里的第一张图 */
+async function resolveTaskCover(task) {
+    // 同一个任务重复规划（比如取消后又点了一次）不该重复查/重复下载封面
+    if (task.coverResolved) return task.cover;
+
+    if (task.rj && RJ_METADATA_ENDPOINT) {
+        try {
+            const meta = await lookupWorkMetadata(task.rj);
+
+            task.work = meta;
+
+            if (meta.coverUrl) {
+                const response = await fetch(meta.coverUrl);
+
+                if (response.ok) {
+                    const blob = await response.blob();
+
+                    task.cover = {
+                        name: `${task.rj}-封面.jpg`,
+                        mime: blob.type || 'image/jpeg',
+                        base64: await blobToBase64(blob),
+                        crop: null
+                    };
+                    task.coverResolved = true;
+
+                    return task.cover;
+                }
+            }
+        } catch (error) {
+            // 单个作品查不到不该拖垮整批
+            task.rjError = error.message;
+            console.warn(`查询 ${task.rj} 失败：`, error);
+        }
+    }
+
+    if (folderBatchCoverCheckbox.checked) {
+        const image = (task.files || []).find(file => FolderFs.IMAGE_EXTENSIONS.test(file.relPath));
+
+        if (image) {
+            try {
+                const blob = await image.handle.getFile();
+
+                task.cover = {
+                    name: image.relPath,
+                    mime: FolderFs.mimeForPath(image.relPath),
+                    base64: await blobToBase64(blob),
+                    crop: null
+                };
+            } catch (error) {
+                console.warn(`读取 ${image.relPath} 失败：`, error);
+            }
+        }
+    }
+
+    task.coverResolved = true;
+
+    return task.cover;
+}
+
+/** 给单个任务冻结一份 job 快照（和单选文件夹时同构） */
+function createTaskJob(task) {
+    return {
+        sourceKind: 'folder',
+        directoryHandle: task.handle,
+        folderRootName: task.name,
+        directoryWritable: true,
+        directoryFiles: task.files,
+        zip: null,
+        files: [],
+        zipName: task.name,
+        coverImage: task.cover,
+        work: task.work,
+        shouldFlatten: folderFlattenCheckbox.checked,
+        shouldTranscodeWav: folderTranscodeCheckbox.checked,
+        shouldDeleteSource: folderDeleteSourceCheckbox.checked,
+        bitrate: MP3_BITRATE
+    };
+}
+
+/** 单个文件夹的规划：构建条目 → 定输出名 → 标记搬动 → 算写入计划 */
+async function planOneFolder(job) {
+    const entries = await buildVirtualEntries(job);
+
+    resolveOutputNames(entries, job);
+    movePassThroughFiles(entries, job);
+
+    return planFolderWrites(entries, job);
+}
+
+/** 把执行结果拼成一句人话（单文件夹和批量里的每个任务共用同一套说法） */
+function summarizeFolderResult(plan, result) {
+    const parts = [`已写入 ${result.writtenCount} 个文件`];
+
+    if (result.unchangedCount) parts.push(`${result.unchangedCount} 个内容相同已跳过`);
+    if (result.movedCount) parts.push(`搬动 ${result.movedCount} 个原样保留的文件`);
+    if (result.deletedCount) parts.push(`删除了 ${result.deletedCount} 个源文件`);
+    if (result.removedDirs.length) parts.push(`清理了 ${result.removedDirs.length} 个空目录`);
+    if (plan.skipped.length) parts.push(`跳过 ${plan.skipped.length} 个重名输出`);
+
+    return parts.join('，');
+}
+
+function collectFolderProblems(result) {
+    return result.warnings.concat(result.failedDeletes, result.failedDirs);
+}
+
+/** 批量主流程：逐个规划（含各作品自己的 RJ/封面）→ 一次确认 → 逐个写回 */
+async function runFolderBatch() {
+    const total = folderTasks.length;
+    let planned = 0;
+
+    for (const task of folderTasks) {
+        if (task.status === 'done') continue;
+
+        setTaskStatus(task, 'planning');
+        setProgress((planned / total) * 0.45, `(${planned + 1}/${total}) 正在扫描「${task.name}」…`);
+
+        try {
+            const scan = await FolderFs.scanDirectory(task.handle, {
+                onProgress: message => setProgress((planned / total) * 0.45, `(${planned + 1}/${total}) ${task.name}：${message}`)
+            });
+
+            task.files = scan.files;
+            task.canWrite = scan.canWrite;
+
+            const vttCount = scan.files.filter(file => isVttFile(file.relPath)).length;
+            const wavCount = scan.files.filter(file => isWavFile(file.relPath)).length;
+
+            setProgress((planned / total) * 0.45, `(${planned + 1}/${total}) ${task.rj ? `查询 ${task.rj} 作品信息…` : '准备中…'}`);
+
+            task.cover = await resolveTaskCover(task);
+            task.job = createTaskJob(task);
+            task.plan = await planOneFolder(task.job);
+
+            task.summary = `${vttCount} 个字幕 · ${wavCount} 个 WAV · 写入 ${task.plan.writes.length}`;
+
+            if (task.plan.writes.length === 0 && task.plan.moves.length === 0) {
+                setTaskStatus(task, 'skipped');
+            } else {
+                setTaskStatus(task, 'planned');
+            }
+        } catch (error) {
+            console.error(`规划「${task.name}」失败:`, error);
+            task.error = error.message;
+            setTaskStatus(task, 'failed');
+        }
+
+        planned++;
+    }
+
+    const actionable = folderTasks.filter(task => task.status === 'planned');
+
+    if (actionable.length === 0) {
+        hideProgress();
+
+        const doneCount = folderTasks.filter(task => task.status === 'done' || task.status === 'partial').length;
+
+        showStatusMessage(doneCount === folderTasks.length && doneCount > 0
+            ? '这批任务已经处理完了（要重跑请重新选择文件夹）。'
+            : '这些文件夹里没有需要写回的内容。');
+        return;
+    }
+
+    hideProgress();
+
+    if (!await openBatchWritebackModal(actionable)) {
+        showStatusMessage('已取消，所有文件夹都没有被改动。', false);
+        return;
+    }
+
+    const totals = { written: 0, unchanged: 0, moved: 0, deleted: 0, dirs: 0, problems: 0 };
+    let finished = 0;
+
+    for (const task of actionable) {
+        setTaskStatus(task, 'running');
+        setProgress(0.5 + (finished / actionable.length) * 0.5, `(${finished + 1}/${actionable.length}) 正在写回「${task.name}」…`);
+
+        try {
+            const result = await executeFolderPlan(task.plan, task.job);
+            const problems = collectFolderProblems(result);
+
+            task.summary = summarizeFolderResult(task.plan, result);
+            task.problems = problems;
+
+            totals.written += result.writtenCount;
+            totals.unchanged += result.unchangedCount;
+            totals.moved += result.movedCount;
+            totals.deleted += result.deletedCount;
+            totals.dirs += result.removedDirs.length;
+            totals.problems += problems.length;
+
+            setTaskStatus(task, problems.length ? 'partial' : 'done');
+        } catch (error) {
+            console.error(`写回「${task.name}」失败:`, error);
+            task.error = error.message;
+            task.problems = [error.message];
+            totals.problems++;
+            setTaskStatus(task, 'failed');
+        }
+
+        // 放掉这一批条目，别把 10 个作品的音频都攒在内存里
+        task.plan = null;
+        task.job = null;
+
+        finished++;
+    }
+
+    hideProgress();
+
+    const failedTasks = folderTasks.filter(task => task.status === 'failed').length;
+    const partialTasks = folderTasks.filter(task => task.status === 'partial').length;
+    const skippedTasks = folderTasks.filter(task => task.status === 'skipped').length;
+    const completed = actionable.length - failedTasks;
+
+    const parts = [
+        `完成 ${completed} 个任务`,
+        `写入 ${totals.written}`,
+        `搬动 ${totals.moved}`,
+        `删除源文件 ${totals.deleted}`,
+        `清理空目录 ${totals.dirs}`
+    ];
+
+    if (skippedTasks) parts.push(`跳过 ${skippedTasks} 个无需处理`);
+    if (partialTasks) parts.push(`${partialTasks} 个有部分失败`);
+    if (failedTasks) parts.push(`${failedTasks} 个整体失败`);
+
+    showStatusMessage(`${parts.join('，')}。`, totals.problems === 0 && failedTasks === 0);
+}
+
+function buildBatchSummary(tasks) {
+    const rows = tasks.map(task => {
+        const plan = task.plan;
+        const bits = [`写入 ${plan.writes.length}`];
+
+        if (plan.newFiles.length) bits.push(`新增 ${plan.newFiles.length}`);
+        if (plan.overwrites.length) bits.push(`覆盖 ${plan.overwrites.length}`);
+        if (plan.moves.length) bits.push(`搬动 ${plan.moves.length}`);
+        if (plan.deletes.length) bits.push(`删除源文件 ${plan.deletes.length}`);
+        if (plan.removeDirs.length) bits.push(`清理空目录 ${plan.removeDirs.length}`);
+        if (plan.skipped.length) bits.push(`跳过重名 ${plan.skipped.length}`);
+
+        const cover = task.cover ? `封面：${task.cover.name}` : '无封面';
+        const rj = task.rj ? task.rj : '无 RJ 号';
+
+        return `<li>${escapeHtml(task.name)}<br><span class="text-gray-400">${escapeHtml(`${rj} · ${cover} · ${bits.join(' · ')}`)}</span></li>`;
+    }).join('');
+
+    const noCover = tasks.filter(task => !task.cover).length;
+    const rjErrors = tasks.filter(task => task.rjError).length;
+    const notes = [];
+
+    if (noCover) {
+        notes.push(`${noCover} 个任务没有封面：没配置 RJ 元数据服务时，可以勾选「批量时用各文件夹里的第一张图片当封面」，或单独处理这几个文件夹。`);
+    }
+
+    if (rjErrors) notes.push(`${rjErrors} 个任务查询作品信息失败（不影响转换，只是没有封面和标签）。`);
+
+    return `
+        <div class="writeback-heading is-new">任务清单（${tasks.length}）</div>
+        <ul class="writeback-list">${rows}</ul>
+        ${notes.map(note => `<p class="text-xs text-amber-600 mt-2">${escapeHtml(note)}</p>`).join('')}
+        <p class="text-xs text-gray-500 mt-3">
+            每个任务只写回<strong>它自己的文件夹</strong>；共 ${tasks.reduce((sum, task) => sum + task.plan.writes.length + task.plan.moves.length, 0)} 个文件会被写入。
+        </p>
+    `;
+}
+
+function openBatchWritebackModal(tasks) {
+    writebackTitle.textContent = `确认批量写回（${tasks.length} 个文件夹）`;
+
+    const mode = folderFlattenCheckbox.checked ? '各自平铺到自己的根目录' : '各自保持原有目录结构';
+
+    writebackTarget.textContent = `逐个写回各自的原路径 · ${mode}`;
+    writebackSummary.innerHTML = buildBatchSummary(tasks);
+    writebackModal.classList.remove('hidden');
+
+    return new Promise(resolve => {
+        modalResolver = resolve;
+    });
 }
 
 // --- 作品信息（RJ 号自动查询）---
@@ -2353,7 +2805,27 @@ function createJob() {
 
 async function convertAndDownload() {
     if (isProcessing) return;
-    if (filesToProcess.length === 0 && !loadedZip && !folderStore) return;
+    if (filesToProcess.length === 0 && !loadedZip && !folderStore && folderTasks.length === 0) return;
+
+    // 批量：每个文件夹一个任务，逐个规划 + 逐个写回
+    if (folderTasks.length > 0) {
+        setProcessing(true);
+        setButtonLoading(true);
+        showStatusMessage('');
+
+        try {
+            await runFolderBatch();
+        } catch (error) {
+            console.error('批量处理过程中发生错误:', error);
+            showStatusMessage(`批量处理失败：${error.message || '请在控制台查看错误信息。'}`);
+        } finally {
+            setProcessing(false);
+            setButtonLoading(false);
+            hideProgress();
+        }
+
+        return;
+    }
 
     // 文件夹的完整清单要扫一遍才知道，而扫描是异步的：先扫完再冻结快照，
     // 后面整条流水线就只认这份快照了
@@ -3076,14 +3548,9 @@ function toBytes(data) {
 }
 
 async function processFolderWriteBack(job) {
-    const entries = await buildVirtualEntries(job);
-
-    resolveOutputNames(entries, job);
-    movePassThroughFiles(entries, job);
-
     setProgress(0.01, '正在核对目标文件夹…');
 
-    const plan = await planFolderWrites(entries, job);
+    const plan = await planOneFolder(job);
 
     if (plan.writes.length === 0 && plan.moves.length === 0) {
         showStatusMessage(plan.skipped.length
@@ -3102,19 +3569,12 @@ async function processFolderWriteBack(job) {
     }
 
     const result = await executeFolderPlan(plan, job);
-    const parts = [`已写入 ${result.writtenCount} 个文件`];
-
-    if (result.unchangedCount) parts.push(`${result.unchangedCount} 个内容相同已跳过`);
-    if (result.movedCount) parts.push(`搬动 ${result.movedCount} 个原样保留的文件`);
-    if (result.deletedCount) parts.push(`删除了 ${result.deletedCount} 个源文件`);
-    if (result.removedDirs.length) parts.push(`清理了 ${result.removedDirs.length} 个空目录`);
-    if (plan.skipped.length) parts.push(`跳过 ${plan.skipped.length} 个重名输出`);
-
-    const problems = result.warnings.concat(result.failedDeletes, result.failedDirs);
+    const summary = summarizeFolderResult(plan, result);
+    const problems = collectFolderProblems(result);
 
     if (problems.length) {
-        showStatusMessage(`${parts.join('，')}；但有 ${problems.length} 项失败：${problems.join('；')}`);
+        showStatusMessage(`${summary}；但有 ${problems.length} 项失败：${problems.join('；')}`);
     } else {
-        showStatusMessage(`${parts.join('，')}。已写回「${job.directoryHandle.name || ''}」。`, false);
+        showStatusMessage(`${summary}。已写回「${job.directoryHandle.name || ''}」。`, false);
     }
 }

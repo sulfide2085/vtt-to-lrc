@@ -2489,10 +2489,304 @@ async function main() {
         check('重开裁切器还原到已保存的区域', /裁切 800×800/.test(cropResult.reopenedLabel) && cropResult.reopenedZoom === '100', `${cropResult.reopenedLabel} / ${cropResult.reopenedZoom}`);
         check('Esc 关闭裁切器且不改动已保存的裁切', cropResult.modalClosedByEsc === true && cropResult.cropStillThere === true, JSON.stringify({ closed: cropResult.modalClosedByEsc, kept: cropResult.cropStillThere }));
 
-        // --- 28. 访问统计（GoatCounter）只在线上真的生效 ---
+        // --- 28. 批量：多个文件夹 = 多个独立任务 ---
+        // 选一个父文件夹，把它下面每个子文件夹当一个任务：各查各的 RJ、各写各的封面、
+        // 各写回自己的目录。这里用 mock RJ 服务给两个作品不同的封面颜色与标题，
+        // 借此证明任务之间没有串味。
+        console.log('\n[28] 批量模式：多个文件夹各自成任务');
+
+        const batchResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+
+            const makeCover = async color => {
+                const canvas = document.createElement('canvas');
+
+                canvas.width = 400;
+                canvas.height = 400;
+
+                const ctx = canvas.getContext('2d');
+
+                ctx.fillStyle = color;
+                ctx.fillRect(0, 0, 400, 400);
+
+                const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.92));
+
+                return { blob, url: URL.createObjectURL(blob) };
+            };
+
+            const coverA = await makeCover('#ff0000');
+            const coverB = await makeCover('#0000ff');
+
+            const originalFetch = window.fetch;
+            const fetchedRj = [];
+
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+
+                if (url.includes('mock-batch.test')) {
+                    const rj = new URL(url).searchParams.get('rj');
+
+                    fetchedRj.push(rj);
+
+                    const table = {
+                        RJ111111: { title: '作品甲的标题', cover: coverA.url },
+                        RJ222222: { title: '作品乙的标题', cover: coverB.url }
+                    };
+
+                    const info = table[rj] || {};
+
+                    return Promise.resolve(new Response(JSON.stringify({
+                        ok: true,
+                        rj,
+                        title: info.title || '',
+                        circle: '测试社团',
+                        voiceBy: ['声优甲'],
+                        genres: ['音声'],
+                        workType: 'ボイス',
+                        releaseDate: '2024-03-01',
+                        coverUrl: info.cover || '',
+                        pageUrl: 'https://example.test/' + rj
+                    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+                }
+
+                return originalFetch(input, init);
+            };
+
+            RJ_METADATA_ENDPOINT = 'https://mock-batch.test';
+
+            const handle = makeFakeDirectoryTree('音声测试', {
+                'RJ111111 作品甲/01.wav': makeTestWav({ frames: 11025, freq: 440 }),
+                'RJ111111 作品甲/01.vtt': 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n甲的第一句\\n',
+                'RJ111111 作品甲/第一話/02.wav': makeTestWav({ frames: 11025, freq: 550 }),
+                'RJ111111 作品甲/第一話/02.vtt': 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n甲的第二句\\n',
+                'RJ222222 作品乙/01.wav': makeTestWav({ frames: 11025, freq: 660 }),
+                'RJ222222 作品乙/01.vtt': 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n乙的第一句\\n'
+            });
+
+            window.__vttTestDirectoryProvider = async () => handle;
+
+            const sampleApic = async bytes => {
+                const apic = findApicImageBytes(bytes);
+
+                if (!apic) return null;
+
+                const bitmap = await createImageBitmap(new Blob([apic], { type: 'image/jpeg' }));
+                const canvas = document.createElement('canvas');
+
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+
+                const ctx = canvas.getContext('2d');
+
+                ctx.drawImage(bitmap, 0, 0);
+
+                const data = ctx.getImageData(Math.round(bitmap.width * 0.5), Math.round(bitmap.height * 0.5), 1, 1).data;
+
+                return { size: bitmap.width, center: [data[0], data[1], data[2]] };
+            };
+
+            const readFolder = folder => {
+                const prefix = folder + '/';
+
+                return handle.list().filter(name => name.startsWith(prefix)).map(name => name.slice(prefix.length)).sort();
+            };
+
+            const readMp3 = async relPath => {
+                const bytes = handle.read(relPath);
+
+                if (!bytes) return null;
+
+                return {
+                    headerText: new TextDecoder('utf-8').decode(bytes.slice(0, 4000)),
+                    apic: await sampleApic(bytes)
+                };
+            };
+
+            try {
+                switchTab('folder');
+                document.getElementById('folder-transcode-wav-checkbox').checked = true;
+                document.getElementById('folder-flatten-checkbox').checked = true;
+                document.getElementById('folder-delete-source-checkbox').checked = true;
+                document.getElementById('folder-batch-checkbox').checked = true;
+
+                await pickSourceFolder();
+
+                const taskList = {
+                    hidden: document.getElementById('file-list-container').classList.contains('hidden'),
+                    title: document.getElementById('file-list-title').textContent,
+                    names: [...document.querySelectorAll('#file-list li')].map(li => li.querySelector('div > div').textContent.trim()),
+                    buttonLabel: document.getElementById('btn-text').textContent
+                };
+
+                // 先取消一次：不该有任何改动
+                let running = convertAndDownload();
+
+                for (let i = 0; i < 300 && document.getElementById('writeback-modal').classList.contains('hidden'); i++) {
+                    await new Promise(r => setTimeout(r, 50));
+                }
+
+                const modal = {
+                    visible: !document.getElementById('writeback-modal').classList.contains('hidden'),
+                    title: document.getElementById('writeback-title').textContent,
+                    target: document.getElementById('writeback-target').textContent,
+                    text: document.getElementById('writeback-summary').textContent
+                };
+
+                document.getElementById('writeback-cancel').click();
+                await running;
+
+                const untouched = handle.list().length === 6;
+
+                // 再来一次，这次确认
+                running = convertAndDownload();
+
+                for (let i = 0; i < 300 && document.getElementById('writeback-modal').classList.contains('hidden'); i++) {
+                    await new Promise(r => setTimeout(r, 50));
+                }
+
+                document.getElementById('writeback-confirm').click();
+                await running;
+
+                const finalA = readFolder('RJ111111 作品甲');
+                const finalB = readFolder('RJ222222 作品乙');
+                const mp3A = await readMp3('RJ111111 作品甲/01.mp3');
+                const mp3B = await readMp3('RJ222222 作品乙/01.mp3');
+
+                return {
+                    taskList,
+                    modal,
+                    untouched,
+                    fetchedRj,
+                    finalA,
+                    finalB,
+                    rootFiles: handle.list().filter(name => !name.includes('/')).sort(),
+                    mp3A,
+                    mp3B,
+                    listAfter: handle.list().sort(),
+                    status: document.getElementById('status-message').textContent
+                };
+            } finally {
+                delete window.__vttTestDirectoryProvider;
+                window.fetch = originalFetch;
+                RJ_METADATA_ENDPOINT = '';
+                document.getElementById('folder-batch-checkbox').checked = false;
+                document.getElementById('folder-flatten-checkbox').checked = false;
+                document.getElementById('folder-delete-source-checkbox').checked = false;
+            }
+        })()`);
+
+        check('批量任务列表列出每个子文件夹', batchResult.taskList.hidden === false && batchResult.taskList.names.length === 2, JSON.stringify(batchResult.taskList));
+        check('任务名就是文件夹名', sameSet(batchResult.taskList.names, ['RJ111111 作品甲', 'RJ222222 作品乙']), JSON.stringify(batchResult.taskList.names));
+        check('按钮文案变成批量写回', /转换并写回 2 个文件夹/.test(batchResult.taskList.buttonLabel), batchResult.taskList.buttonLabel);
+        check('弹出一次批量确认（不是每个文件夹弹一次）', batchResult.modal.visible === true && /批量写回/.test(batchResult.modal.title), JSON.stringify(batchResult.modal));
+        check('确认清单里逐个列出任务与各自封面', batchResult.modal.text.includes('RJ111111 作品甲') && batchResult.modal.text.includes('RJ222222 作品乙') && /封面：/.test(batchResult.modal.text), batchResult.modal.text.slice(0, 400));
+        check('取消批量后一个文件都没动', batchResult.untouched === true, JSON.stringify(batchResult.listAfter));
+        check('两个作品的 RJ 号都被查询', sameSet(batchResult.fetchedRj, ['RJ111111', 'RJ222222']), JSON.stringify(batchResult.fetchedRj));
+        check('作品甲只写回自己的文件夹（含平铺展开 + 剪掉源文件）', sameSet(batchResult.finalA, ['01.lrc', '01.mp3', '02.lrc', '02.mp3']), JSON.stringify(batchResult.finalA));
+        check('作品乙只写回自己的文件夹', sameSet(batchResult.finalB, ['01.lrc', '01.mp3']), JSON.stringify(batchResult.finalB));
+        check('父文件夹本身没有被写入任何文件', batchResult.rootFiles.length === 0, JSON.stringify(batchResult.rootFiles));
+        check('作品甲的封面用的是它自己的（红色）', batchResult.mp3A.apic.center[0] > 150 && batchResult.mp3A.apic.center[2] < 90, JSON.stringify(batchResult.mp3A.apic));
+        check('作品乙的封面用的是它自己的（蓝色）', batchResult.mp3B.apic.center[2] > 150 && batchResult.mp3B.apic.center[0] < 90, JSON.stringify(batchResult.mp3B.apic));
+        check('两个 MP3 各写各的专辑标签', batchResult.mp3A.headerText.includes('作品甲的标题') && batchResult.mp3B.headerText.includes('作品乙的标题'), JSON.stringify([batchResult.mp3A.headerText.slice(0, 120), batchResult.mp3B.headerText.slice(0, 120)]));
+        check('批量结束后汇报任务数与各项数量', /完成 2 个任务/.test(batchResult.status) && /写入 6/.test(batchResult.status), batchResult.status);
+
+        // --- 29. 批量：没配 RJ 服务时用各文件夹自己的图片当封面 ---
+        // 线上默认没配 RJ 元数据服务，这时批量要靠"每个文件夹里的第一张图片"才能有封面。
+        console.log('\n[29] 批量模式：用各文件夹自己的图片当封面');
+
+        const batchCoverResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+
+            const makeCover = async color => {
+                const canvas = document.createElement('canvas');
+
+                canvas.width = 300;
+                canvas.height = 300;
+
+                const ctx = canvas.getContext('2d');
+
+                ctx.fillStyle = color;
+                ctx.fillRect(0, 0, 300, 300);
+
+                const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.92));
+
+                return new Uint8Array(await blob.arrayBuffer());
+            };
+
+            const handle = makeFakeDirectoryTree('无服务批量', {
+                '作品一/01.wav': makeTestWav({ frames: 11025 }),
+                '作品一/01.vtt': 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n一\\n',
+                '作品一/封面.jpg': await makeCover('#00ff00'),
+                '作品二/01.wav': makeTestWav({ frames: 11025, freq: 700 }),
+                '作品二/01.vtt': 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n二\\n',
+                '作品二/封面.jpg': await makeCover('#ffff00')
+            });
+
+            window.__vttTestDirectoryProvider = async () => handle;
+
+            const sampleApic = async bytes => {
+                const apic = findApicImageBytes(bytes);
+
+                if (!apic) return null;
+
+                const bitmap = await createImageBitmap(new Blob([apic], { type: 'image/jpeg' }));
+                const canvas = document.createElement('canvas');
+
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+
+                const ctx = canvas.getContext('2d');
+
+                ctx.drawImage(bitmap, 0, 0);
+
+                const data = ctx.getImageData(Math.round(bitmap.width / 2), Math.round(bitmap.height / 2), 1, 1).data;
+
+                return [data[0], data[1], data[2]];
+            };
+
+            try {
+                switchTab('folder');
+                document.getElementById('folder-transcode-wav-checkbox').checked = true;
+                document.getElementById('folder-batch-checkbox').checked = true;
+                document.getElementById('folder-batch-cover-checkbox').checked = true;
+
+                await pickSourceFolder();
+
+                const running = convertAndDownload();
+
+                for (let i = 0; i < 300 && document.getElementById('writeback-modal').classList.contains('hidden'); i++) {
+                    await new Promise(r => setTimeout(r, 50));
+                }
+
+                const modalText = document.getElementById('writeback-summary').textContent;
+
+                document.getElementById('writeback-confirm').click();
+                await running;
+
+                const colorOne = await sampleApic(handle.read('作品一/01.mp3'));
+                const colorTwo = await sampleApic(handle.read('作品二/01.mp3'));
+
+                return {
+                    modalText,
+                    colorOne,
+                    colorTwo,
+                    status: document.getElementById('status-message').textContent
+                };
+            } finally {
+                delete window.__vttTestDirectoryProvider;
+                document.getElementById('folder-batch-checkbox').checked = false;
+                document.getElementById('folder-batch-cover-checkbox').checked = false;
+            }
+        })()`);
+
+        check('清单里写明各任务用的封面文件', /封面：封面\.jpg/.test(batchCoverResult.modalText) && (batchCoverResult.modalText.match(/封面：封面\.jpg/g) || []).length === 2, batchCoverResult.modalText.slice(0, 300));
+        check('作品一嵌的是自己文件夹里的绿封面', batchCoverResult.colorOne && batchCoverResult.colorOne[1] > 150 && batchCoverResult.colorOne[0] < 120, JSON.stringify(batchCoverResult.colorOne));
+        check('作品二嵌的是自己文件夹里的黄封面', batchCoverResult.colorTwo && batchCoverResult.colorTwo[0] > 150 && batchCoverResult.colorTwo[1] > 150 && batchCoverResult.colorTwo[2] < 120, JSON.stringify(batchCoverResult.colorTwo));
+
+        // --- 30. 访问统计（GoatCounter）只在线上真的生效 ---
         // 线上必须发出 /count 请求，否则统计数据会静默丢失；
         // 本地 file:// 则必须不发，避免开发时污染线上数据。
-        console.log('\n[28] 访问统计（GoatCounter）');
+        console.log('\n[30] 访问统计（GoatCounter）');
 
         await pageCdp.send('Network.enable');
 

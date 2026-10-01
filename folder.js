@@ -425,6 +425,7 @@
 
     global.FolderFs = {
         MAX_DEPTH,
+        JUNK_DIRS,
         IMAGE_EXTENSIONS,
         MIME_BY_EXTENSION,
         isSupported,

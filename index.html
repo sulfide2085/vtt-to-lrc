@@ -10,7 +10,7 @@
         还在跑缓存里的旧 JS，会出现"代码明明修好了、用户还在报旧错误"的情况。
         改版本号时记得把这里和页脚一起改（端到端测试会校验两者一致）。
     -->
-    <link rel="stylesheet" href="styles.css?v=1.10.0">
+    <link rel="stylesheet" href="styles.css?v=1.11.0">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <!-- lamejs：LAME 的 JS 移植，用于把 WAV 转码成 320 kbps 的 MP3（主源失败时自动切备用源） -->
@@ -105,6 +105,15 @@
                         <input type="checkbox" id="folder-delete-source-checkbox" class="w-4 h-4 text-red-500 rounded border-gray-300 focus:ring-red-500">
                         <span class="text-sm text-gray-700">剪掉源文件 — 转码成功后删除原 WAV 与已转成 LRC 的 VTT（不可撤销）</span>
                     </label>
+                    <label class="flex items-center gap-2 cursor-pointer select-none">
+                        <input type="checkbox" id="folder-batch-checkbox" class="w-4 h-4 text-blue-500 rounded border-gray-300 focus:ring-blue-500">
+                        <span class="text-sm text-gray-700">批量 — 把所选文件夹下的<strong>每个子文件夹</strong>当作一个独立任务（各查各的 RJ、各写各的封面）</span>
+                    </label>
+                    <label class="flex items-center gap-2 cursor-pointer select-none">
+                        <input type="checkbox" id="folder-batch-cover-checkbox" class="w-4 h-4 text-blue-500 rounded border-gray-300 focus:ring-blue-500">
+                        <span class="text-sm text-gray-700">批量时用各文件夹里的第一张图片当封面（没部署 RJ 服务时用）</span>
+                    </label>
+                    <p class="text-xs text-gray-400">也可以直接把<strong>多个文件夹</strong>拖进来，每个文件夹都会成为一个任务。</p>
                     <p id="folder-note" class="text-xs text-gray-400"></p>
                 </div>
 
@@ -167,7 +176,7 @@
                     <span>GitHub · sulfide2085/vtt-to-lrc</span>
                 </a>
             </div>
-            <div>v1.10.0</div>
+            <div>v1.11.0</div>
         </footer>
     </div>
 
@@ -228,9 +237,9 @@
         </div>
     </div>
 
-    <script src="audio.js?v=1.10.0"></script>
-    <script src="folder.js?v=1.10.0"></script>
-    <script src="app.js?v=1.10.0"></script>
+    <script src="audio.js?v=1.11.0"></script>
+    <script src="folder.js?v=1.11.0"></script>
+    <script src="app.js?v=1.11.0"></script>
 
     <!--
         访问统计：GoatCounter
