@@ -2783,10 +2783,165 @@ async function main() {
         check('作品一嵌的是自己文件夹里的绿封面', batchCoverResult.colorOne && batchCoverResult.colorOne[1] > 150 && batchCoverResult.colorOne[0] < 120, JSON.stringify(batchCoverResult.colorOne));
         check('作品二嵌的是自己文件夹里的黄封面', batchCoverResult.colorTwo && batchCoverResult.colorTwo[0] > 150 && batchCoverResult.colorTwo[1] > 150 && batchCoverResult.colorTwo[2] < 120, JSON.stringify(batchCoverResult.colorTwo));
 
-        // --- 30. 访问统计（GoatCounter）只在线上真的生效 ---
+        // --- 30. 批量：每个任务自己选封面（手动优先于自动挑选） ---
+        // 自动挑"第一张图片"经常挑到特典插图，所以每个任务都能手动指定；
+        // 手动选过的封面必须压过自动挑选，选「不用封面」也必须算数。
+        console.log('\n[30] 批量模式：逐个任务手动选封面');
+
+        const taskPickResult = await evaluate(pageCdp, `(async () => {
+            ${MAKE_WAV_SOURCE}
+
+            const makeImage = async (color, type) => {
+                const canvas = document.createElement('canvas');
+
+                canvas.width = 400;
+                canvas.height = 400;
+
+                const ctx = canvas.getContext('2d');
+
+                ctx.fillStyle = color;
+                ctx.fillRect(0, 0, 400, 400);
+
+                const blob = await new Promise(r => canvas.toBlob(r, type === 'png' ? 'image/png' : 'image/jpeg', 0.92));
+
+                return new Uint8Array(await blob.arrayBuffer());
+            };
+
+            // 每个作品两张图：01 是红的（会被自动挑中），02 是蓝的（我们手动选它）
+            const handle = makeFakeDirectoryTree('手动封面', {
+                '作品甲/01_封面.jpg': await makeImage('#ff0000', 'jpeg'),
+                '作品甲/02_特典.png': await makeImage('#0000ff', 'png'),
+                '作品甲/01.wav': makeTestWav({ frames: 11025 }),
+                '作品甲/01.vtt': 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n甲\\n',
+                '作品乙/01_封面.jpg': await makeImage('#ff0000', 'jpeg'),
+                '作品乙/02_特典.png': await makeImage('#0000ff', 'png'),
+                '作品乙/01.wav': makeTestWav({ frames: 11025, freq: 700 }),
+                '作品乙/01.vtt': 'WEBVTT\\n\\n00:00.000 --> 00:02.000\\n乙\\n'
+            });
+
+            window.__vttTestDirectoryProvider = async () => handle;
+
+            const sampleApic = async bytes => {
+                const apic = findApicImageBytes(bytes);
+
+                if (!apic) return null;
+
+                const bitmap = await createImageBitmap(new Blob([apic], { type: 'image/jpeg' }));
+                const canvas = document.createElement('canvas');
+
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+
+                const ctx = canvas.getContext('2d');
+
+                ctx.drawImage(bitmap, 0, 0);
+
+                const data = ctx.getImageData(Math.round(bitmap.width / 2), Math.round(bitmap.height / 2), 1, 1).data;
+
+                return [data[0], data[1], data[2]];
+            };
+
+            const waitFor = async (test, label) => {
+                for (let i = 0; i < 300; i++) {
+                    if (test()) return true;
+
+                    await new Promise(r => setTimeout(r, 50));
+                }
+
+                throw new Error('等待超时：' + label);
+            };
+
+            try {
+                switchTab('folder');
+                document.getElementById('folder-transcode-wav-checkbox').checked = true;
+                document.getElementById('folder-batch-checkbox').checked = true;
+                document.getElementById('folder-batch-cover-checkbox').checked = false;
+
+                await pickSourceFolder();
+
+                // 第一个任务：打开选封面，挑第 2 张（蓝色的特典图）
+                document.querySelector('[data-task-cover="0"]').click();
+                await waitFor(() => document.querySelectorAll('#task-cover-grid .image-thumb-wrapper').length === 2, '封面候选网格');
+
+                const pickerUi = {
+                    modalVisible: !document.getElementById('task-cover-modal').classList.contains('hidden'),
+                    title: document.getElementById('task-cover-title').textContent,
+                    note: document.getElementById('task-cover-note').textContent,
+                    count: document.querySelectorAll('#task-cover-grid .image-thumb-wrapper').length
+                };
+
+                document.querySelectorAll('#task-cover-grid .image-thumb-wrapper')[1].click();
+                pickerUi.statusAfterPick = document.getElementById('task-cover-status').textContent;
+
+                // 候选图也能调裁切（复用同一个裁切器）
+                document.getElementById('task-cover-crop').click();
+                await waitFor(() => !document.getElementById('crop-modal').classList.contains('hidden'), '裁切器打开');
+                pickerUi.cropOpened = true;
+                document.getElementById('crop-cancel').click();
+
+                document.getElementById('task-cover-confirm').click();
+
+                const firstCover = folderTasks[0].cover ? folderTasks[0].cover.name : null;
+
+                // 第二个任务：明确选「不用封面」
+                document.querySelector('[data-task-cover="1"]').click();
+                await waitFor(() => document.querySelectorAll('#task-cover-grid .image-thumb-wrapper').length === 2, '第二个任务的候选网格');
+                document.getElementById('task-cover-none').click();
+
+                const secondCover = folderTasks[1].cover;
+
+                // 即使勾上"用第一张图片"，手动选择也必须优先
+                document.getElementById('folder-batch-cover-checkbox').checked = true;
+
+                const rowCoverThumbs = document.querySelectorAll('#file-list .task-cover-thumb').length;
+                const emptyBadges = document.querySelectorAll('#file-list .task-cover-empty').length;
+
+                const running = convertAndDownload();
+
+                await waitFor(() => !document.getElementById('writeback-modal').classList.contains('hidden'), '批量确认弹窗');
+
+                const modalText = document.getElementById('writeback-summary').textContent;
+
+                document.getElementById('writeback-confirm').click();
+                await running;
+
+                return {
+                    pickerUi,
+                    firstCover,
+                    secondCover,
+                    rowCoverThumbs,
+                    emptyBadges,
+                    modalText: modalText.slice(0, 300),
+                    colorA: await sampleApic(handle.read('作品甲/01.mp3')),
+                    colorB: await sampleApic(handle.read('作品乙/01.mp3')),
+                    status: document.getElementById('status-message').textContent
+                };
+            } finally {
+                delete window.__vttTestDirectoryProvider;
+                document.getElementById('folder-batch-checkbox').checked = false;
+                document.getElementById('folder-batch-cover-checkbox').checked = false;
+            }
+        })()`);
+
+        check('任务行里有「选封面」入口', taskPickResult.rowCoverThumbs + taskPickResult.emptyBadges === 2, JSON.stringify(taskPickResult));
+        check('弹窗列出该任务文件夹里的图片', taskPickResult.pickerUi.modalVisible === true && taskPickResult.pickerUi.count === 2 && taskPickResult.pickerUi.title.includes('作品甲'), JSON.stringify(taskPickResult.pickerUi));
+        check('提示里说明找到了几张图片', /2 张图片/.test(taskPickResult.pickerUi.note), taskPickResult.pickerUi.note);
+        check('点选后显示已选文件名', taskPickResult.pickerUi.statusAfterPick.includes('已选：02_特典.png'), taskPickResult.pickerUi.statusAfterPick);
+        check('候选图也能打开裁切器', taskPickResult.pickerUi.cropOpened === true, JSON.stringify(taskPickResult.pickerUi));
+        check('手动选的封面记在任务上（第 2 张，不是自动会挑的第 1 张）', taskPickResult.firstCover === '02_特典.png', String(taskPickResult.firstCover));
+        check('可以给任务选「不用封面」', taskPickResult.secondCover === null, JSON.stringify(taskPickResult.secondCover));
+        check('确认清单里体现各自封面', taskPickResult.modalText.includes('02_特典.png') && /无封面/.test(taskPickResult.modalText), taskPickResult.modalText);
+        check(
+            '手动选的封面压过了"用第一张图片"（作品甲嵌的是蓝色特典图）',
+            taskPickResult.colorA && taskPickResult.colorA[2] > 150 && taskPickResult.colorA[0] < 90,
+            JSON.stringify(taskPickResult.colorA)
+        );
+        check('选了「不用封面」的任务确实没有封面', taskPickResult.colorB === null, JSON.stringify(taskPickResult.colorB));
+
+        // --- 31. 访问统计（GoatCounter）只在线上真的生效 ---
         // 线上必须发出 /count 请求，否则统计数据会静默丢失；
         // 本地 file:// 则必须不发，避免开发时污染线上数据。
-        console.log('\n[30] 访问统计（GoatCounter）');
+        console.log('\n[31] 访问统计（GoatCounter）');
 
         await pageCdp.send('Network.enable');
 

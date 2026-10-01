@@ -10,7 +10,7 @@
         还在跑缓存里的旧 JS，会出现"代码明明修好了、用户还在报旧错误"的情况。
         改版本号时记得把这里和页脚一起改（端到端测试会校验两者一致）。
     -->
-    <link rel="stylesheet" href="styles.css?v=1.11.0">
+    <link rel="stylesheet" href="styles.css?v=1.12.0">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <!-- lamejs：LAME 的 JS 移植，用于把 WAV 转码成 320 kbps 的 MP3（主源失败时自动切备用源） -->
@@ -176,7 +176,7 @@
                     <span>GitHub · sulfide2085/vtt-to-lrc</span>
                 </a>
             </div>
-            <div>v1.11.0</div>
+            <div>v1.12.0</div>
         </footer>
     </div>
 
@@ -237,9 +237,36 @@
         </div>
     </div>
 
-    <script src="audio.js?v=1.11.0"></script>
-    <script src="folder.js?v=1.11.0"></script>
-    <script src="app.js?v=1.11.0"></script>
+    <!--
+        批量：给单个任务挑封面。列出这个任务文件夹里找到的图片，点一张即可，
+        还能用和主界面同一个裁切器调框选区域。
+    -->
+    <div id="task-cover-modal" class="modal-backdrop hidden">
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="task-cover-title">
+            <h2 id="task-cover-title" class="text-lg font-bold text-gray-800">选择封面</h2>
+            <p id="task-cover-note" class="text-sm text-gray-500 mt-1"></p>
+            <div id="task-cover-grid" class="grid grid-cols-3 sm:grid-cols-4 gap-3 max-h-64 overflow-y-auto pr-2 mt-4"></div>
+            <p id="task-cover-status" class="text-xs text-gray-400 mt-2"></p>
+            <div class="mt-5 flex flex-col sm:flex-row gap-3">
+                <button id="task-cover-confirm" type="button" class="w-full bg-blue-500 text-white font-bold py-3 px-4 rounded-xl shadow-md hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-all duration-200 btn">
+                    确定
+                </button>
+                <button id="task-cover-crop" type="button" class="w-full sm:w-auto shrink-0 whitespace-nowrap bg-gray-100 text-gray-700 font-bold py-3 px-5 rounded-xl hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-400 transition-all duration-200 btn">
+                    调整裁切…
+                </button>
+                <button id="task-cover-none" type="button" class="w-full sm:w-auto shrink-0 whitespace-nowrap bg-gray-100 text-gray-700 font-bold py-3 px-5 rounded-xl hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-400 transition-all duration-200 btn">
+                    不用封面
+                </button>
+                <button id="task-cover-cancel" type="button" class="w-full sm:w-auto shrink-0 whitespace-nowrap bg-gray-200 text-gray-700 font-bold py-3 px-5 rounded-xl hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-400 transition-all duration-200 btn">
+                    取消
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="audio.js?v=1.12.0"></script>
+    <script src="folder.js?v=1.12.0"></script>
+    <script src="app.js?v=1.12.0"></script>
 
     <!--
         访问统计：GoatCounter

@@ -37,6 +37,15 @@ const cropSizeLabel = document.getElementById('crop-size-label');
 const cropConfirmBtn = document.getElementById('crop-confirm');
 const cropResetBtn = document.getElementById('crop-reset');
 const cropCancelBtn = document.getElementById('crop-cancel');
+const taskCoverModal = document.getElementById('task-cover-modal');
+const taskCoverTitle = document.getElementById('task-cover-title');
+const taskCoverNote = document.getElementById('task-cover-note');
+const taskCoverGrid = document.getElementById('task-cover-grid');
+const taskCoverStatus = document.getElementById('task-cover-status');
+const taskCoverConfirmBtn = document.getElementById('task-cover-confirm');
+const taskCoverCropBtn = document.getElementById('task-cover-crop');
+const taskCoverNoneBtn = document.getElementById('task-cover-none');
+const taskCoverCancelBtn = document.getElementById('task-cover-cancel');
 const transcodeWavCheckbox = document.getElementById('transcode-wav-checkbox');
 const lameStatus = document.getElementById('lame-status');
 const progressContainer = document.getElementById('progress-container');
@@ -932,6 +941,9 @@ async function loadBatchTasksFromHandles(handles, parentName) {
         counts: null,
         cover: null,
         coverResolved: false,
+        coverManual: false,
+        imageCache: null,
+        imageTotal: 0,
         work: null,
         rj: findRjCodeIn(String(handle.name || '')),
         rjError: null,
@@ -963,18 +975,24 @@ function renderBatchTaskList() {
     folderTasks.forEach((task, index) => {
         const li = document.createElement('li');
 
-        li.className = 'list-item flex items-start justify-between gap-3 bg-gray-50 p-3 rounded-lg';
+        li.className = 'list-item flex items-start gap-3 bg-gray-50 p-3 rounded-lg';
         li.dataset.taskIndex = String(index);
 
         const label = TASK_STATUS_LABELS[task.status] || task.status;
         const statusClass = TASK_STATUS_CLASSES[task.status] || 'text-gray-500';
         const safeName = escapeHtml(task.name);
         const detail = escapeHtml(task.summary || task.error || '');
+        const cover = task.cover
+            ? `<img class="task-cover-thumb" src="data:${task.cover.mime};base64,${task.cover.base64}" alt="">`
+            : '<div class="task-cover-empty">无封面</div>';
+        const coverLabel = task.cover ? '换封面' : '选封面';
 
         li.innerHTML = `
-            <div class="min-w-0">
+            ${cover}
+            <div class="min-w-0 flex-1">
                 <div class="text-sm font-medium text-gray-700 truncate" title="${safeName}">${safeName}</div>
                 ${detail ? `<div class="text-xs text-gray-500 mt-0.5 break-words">${detail}</div>` : ''}
+                <button type="button" class="task-cover-btn mt-1" data-task-cover="${index}">${coverLabel}</button>
             </div>
             <span class="text-sm shrink-0 ${statusClass}">${label}</span>
         `;
@@ -988,8 +1006,201 @@ function renderBatchTaskList() {
     updateActionButtonLabel();
 }
 
-/** 批量里每个任务的封面：优先 RJ 元数据的封面，退而用文件夹里的第一张图 */
+// --- 批量：给单个任务挑封面 ---
+
+let taskCoverDraft = null; // { taskIndex, images: [{ name, mime, base64, crop }], selectedIndex }
+
+// 任务行里的「选封面 / 换封面」用事件委托，任务列表重绘后不用重新绑
+fileList.addEventListener('click', event => {
+    const button = event.target.closest('[data-task-cover]');
+
+    if (!button) return;
+
+    event.preventDefault();
+    openTaskCoverPicker(Number(button.dataset.taskCover));
+});
+
+/** 把一个任务文件夹里的图片读成候选列表（缩略图要 base64，所以按需读、按需缓存） */
+async function collectTaskImages(task) {
+    if (task.imageCache) return task.imageCache;
+
+    if (!task.files) {
+        const scan = await FolderFs.scanDirectory(task.handle);
+
+        task.files = scan.files;
+        task.canWrite = scan.canWrite;
+    }
+
+    const imageFiles = task.files.filter(file => FolderFs.IMAGE_EXTENSIONS.test(file.relPath));
+    const images = [];
+
+    for (const file of imageFiles.slice(0, 40)) {
+        try {
+            const blob = await file.handle.getFile();
+
+            images.push({
+                name: file.relPath,
+                mime: FolderFs.mimeForPath(file.relPath),
+                base64: await blobToBase64(blob),
+                crop: null
+            });
+        } catch (error) {
+            console.warn(`读取 ${file.relPath} 失败：`, error);
+        }
+    }
+
+    task.imageCache = images;
+    task.imageTotal = imageFiles.length;
+
+    return images;
+}
+
+async function openTaskCoverPicker(taskIndex) {
+    const task = folderTasks[taskIndex];
+
+    if (!task) return;
+
+    taskCoverModal.classList.remove('hidden');
+    taskCoverTitle.textContent = `为「${task.name}」选择封面`;
+    taskCoverNote.textContent = '正在读取这个文件夹里的图片…';
+    taskCoverGrid.innerHTML = '';
+    taskCoverStatus.textContent = '';
+    taskCoverDraft = null;
+
+    let images;
+
+    try {
+        images = await collectTaskImages(task);
+    } catch (error) {
+        console.error('读取任务图片失败:', error);
+        closeTaskCoverPicker();
+        showStatusMessage(`读取「${task.name}」里的图片失败：${error.message}`);
+        return;
+    }
+
+    // 把当前封面（不管是自动挑的还是手动选的）认回来，作为默认选中项
+    const currentIndex = task.cover ? images.findIndex(image => image.base64 === task.cover.base64) : -1;
+
+    taskCoverDraft = {
+        taskIndex,
+        images,
+        selectedIndex: currentIndex >= 0 ? currentIndex : (images.length ? 0 : -1)
+    };
+
+    if (images.length === 0) {
+        taskCoverNote.textContent = `「${task.name}」里没有找到图片文件。`;
+    } else {
+        taskCoverNote.textContent = task.imageTotal > images.length
+            ? `这个文件夹里有 ${task.imageTotal} 张图片，先列出前 ${images.length} 张。点一张作为封面：`
+            : `这个文件夹里找到 ${images.length} 张图片。点一张作为封面：`;
+    }
+
+    renderTaskCoverGrid();
+}
+
+function renderTaskCoverGrid() {
+    if (!taskCoverDraft) return;
+
+    taskCoverGrid.innerHTML = '';
+
+    taskCoverDraft.images.forEach((image, index) => {
+        const wrapper = document.createElement('div');
+
+        wrapper.className = 'image-thumb-wrapper';
+        wrapper.dataset.index = String(index);
+        wrapper.title = image.name;
+
+        const img = document.createElement('img');
+
+        img.src = `data:${image.mime};base64,${image.base64}`;
+        img.alt = image.name;
+
+        const check = document.createElement('div');
+
+        check.className = 'cover-check';
+        check.textContent = '✓';
+
+        if (index === taskCoverDraft.selectedIndex) wrapper.classList.add('selected');
+
+        wrapper.appendChild(img);
+        wrapper.appendChild(check);
+        wrapper.addEventListener('click', () => {
+            taskCoverDraft.selectedIndex = index;
+            renderTaskCoverGrid();
+        });
+
+        taskCoverGrid.appendChild(wrapper);
+    });
+
+    const selected = taskCoverDraft.images[taskCoverDraft.selectedIndex];
+
+    if (selected) {
+        taskCoverStatus.textContent = selected.crop
+            ? `已选：${selected.name}（已自定义裁切区域）`
+            : `已选：${selected.name}`;
+    }
+}
+
+function closeTaskCoverPicker() {
+    taskCoverModal.classList.add('hidden');
+    taskCoverGrid.innerHTML = '';
+    taskCoverDraft = null;
+}
+
+taskCoverCancelBtn.addEventListener('click', () => closeTaskCoverPicker());
+
+taskCoverCropBtn.addEventListener('click', () => {
+    if (!taskCoverDraft || taskCoverDraft.selectedIndex < 0) return;
+
+    const image = taskCoverDraft.images[taskCoverDraft.selectedIndex];
+
+    // 复用主界面那套裁切器：确认后写回这张候选图自己的 crop
+    openCropEditor(image, () => renderTaskCoverGrid());
+});
+
+taskCoverNoneBtn.addEventListener('click', () => {
+    if (!taskCoverDraft) return;
+
+    const task = folderTasks[taskCoverDraft.taskIndex];
+
+    if (task) {
+        task.cover = null;
+        task.coverManual = true;
+        task.coverResolved = true;
+        task.imageCache = null;
+    }
+
+    closeTaskCoverPicker();
+    renderBatchTaskList();
+});
+
+taskCoverConfirmBtn.addEventListener('click', () => {
+    if (!taskCoverDraft) return;
+
+    const task = folderTasks[taskCoverDraft.taskIndex];
+    const image = taskCoverDraft.images[taskCoverDraft.selectedIndex];
+
+    if (task && image) {
+        task.cover = {
+            name: image.name,
+            mime: image.mime,
+            base64: image.base64,
+            crop: image.crop ? { ...image.crop } : null
+        };
+        // 手动选过的封面优先，自动挑选（RJ / 第一张图）不再覆盖它
+        task.coverManual = true;
+        task.coverResolved = true;
+    }
+
+    closeTaskCoverPicker();
+    renderBatchTaskList();
+});
+
+/** 批量里每个任务的封面：手动选过就用手动选的，否则优先 RJ 元数据的封面，再退到文件夹里的第一张图 */
 async function resolveTaskCover(task) {
+    // 手动选的封面永远优先
+    if (task.coverManual) return task.cover;
+
     // 同一个任务重复规划（比如取消后又点了一次）不该重复查/重复下载封面
     if (task.coverResolved) return task.cover;
 
@@ -1100,15 +1311,23 @@ async function runFolderBatch() {
     let planned = 0;
 
     for (const task of folderTasks) {
-        if (task.status === 'done') continue;
+        // 每次点都重新规划：这样"改完封面再点一次"能直接生效（已写好的文件会被内容比对跳过）
+        task.plan = null;
+        task.job = null;
+        task.error = null;
+        task.problems = [];
+        task.status = 'pending';
 
         setTaskStatus(task, 'planning');
         setProgress((planned / total) * 0.45, `(${planned + 1}/${total}) 正在扫描「${task.name}」…`);
 
         try {
-            const scan = await FolderFs.scanDirectory(task.handle, {
-                onProgress: message => setProgress((planned / total) * 0.45, `(${planned + 1}/${total}) ${task.name}：${message}`)
-            });
+            // 挑封面时可能已经扫过了，直接复用
+            const scan = task.files
+                ? { files: task.files, canWrite: task.canWrite }
+                : await FolderFs.scanDirectory(task.handle, {
+                    onProgress: message => setProgress((planned / total) * 0.45, `(${planned + 1}/${total}) ${task.name}：${message}`)
+                });
 
             task.files = scan.files;
             task.canWrite = scan.canWrite;
@@ -1240,7 +1459,7 @@ function buildBatchSummary(tasks) {
     const notes = [];
 
     if (noCover) {
-        notes.push(`${noCover} 个任务没有封面：没配置 RJ 元数据服务时，可以勾选「批量时用各文件夹里的第一张图片当封面」，或单独处理这几个文件夹。`);
+        notes.push(`${noCover} 个任务没有封面：可以在上面的任务列表里逐个点「选封面」，或勾选「批量时用各文件夹里的第一张图片当封面」后重来。`);
     }
 
     if (rjErrors) notes.push(`${rjErrors} 个任务查询作品信息失败（不影响转换，只是没有封面和标签）。`);
@@ -1767,8 +1986,9 @@ const MIN_CROP_ZOOM = 1;
 const MAX_CROP_ZOOM = 4;
 const COVER_OUTPUT_SIZE = 800;
 
-let cropSession = null; // { index, width, height, viewport, baseScale, zoom, offsetX, offsetY }
+let cropSession = null; // { width, height, viewport, baseScale, zoom, offsetX, offsetY }
 let cropDrag = null;
+let cropEditorTarget = null; // { source, after } 当前在裁切谁、确认后交给谁
 
 function clampNumber(value, min, max) {
     return Math.min(Math.max(value, min), max);
@@ -1812,12 +2032,15 @@ function updateCropAffordance() {
     cropHint.classList.add('hidden');
 }
 
-async function openCropEditor() {
-    const index = selectedCoverIndex();
+/**
+ * 打开裁切器。
+ * source 是任意一张"待当封面"的图 { name, mime, base64, crop }——既可能是主界面的候选图，
+ * 也可能是批量里某个任务选中的图；after 是确认后的回调（把裁切结果写回它自己的归属处）。
+ */
+async function openCropEditor(source, after) {
+    if (!source) return;
 
-    if (index < 0) return;
-
-    const source = zipImages[index];
+    cropEditorTarget = { source, after: typeof after === 'function' ? after : null };
 
     cropModal.classList.remove('hidden');
     cropBusy.classList.remove('hidden');
@@ -1849,7 +2072,6 @@ async function openCropEditor() {
     const viewport = cropViewport.clientWidth || 288;
 
     cropSession = {
-        index,
         width: bitmap.width,
         height: bitmap.height,
         viewport,
@@ -1953,9 +2175,25 @@ function closeCropEditor() {
 
     cropSession = null;
     cropDrag = null;
+    cropEditorTarget = null;
 }
 
-cropOpenBtn.addEventListener('click', () => openCropEditor());
+// 主界面的「调整封面裁切…」：裁切当前选中的候选图，确认后同步到 selectedCoverImage
+cropOpenBtn.addEventListener('click', () => {
+    const index = selectedCoverIndex();
+
+    if (index < 0) return;
+
+    const source = zipImages[index];
+
+    openCropEditor(source, () => {
+        if (selectedCoverImage && selectedCoverImage.base64 === source.base64) {
+            selectedCoverImage.crop = source.crop ? { ...source.crop } : null;
+        }
+
+        updateCropAffordance();
+    });
+});
 cropConfirmBtn.addEventListener('click', () => confirmCrop());
 cropResetBtn.addEventListener('click', () => {
     if (!cropSession) return;
@@ -1968,23 +2206,21 @@ cropResetBtn.addEventListener('click', () => {
 cropCancelBtn.addEventListener('click', () => closeCropEditor());
 
 function confirmCrop() {
-    if (!cropSession) return;
+    if (!cropSession || !cropEditorTarget) return;
 
     const crop = cropRectFromSession(cropSession);
-    const source = zipImages[cropSession.index];
 
-    source.crop = {
+    cropEditorTarget.source.crop = {
         x: Math.round(crop.x),
         y: Math.round(crop.y),
         size: Math.round(crop.size)
     };
 
-    if (selectedCoverImage && selectedCoverImage.base64 === source.base64) {
-        selectedCoverImage.crop = { ...source.crop };
-    }
+    const after = cropEditorTarget.after;
 
     closeCropEditor();
-    updateCropAffordance();
+
+    if (after) after();
 }
 
 cropViewport.addEventListener('pointerdown', event => {

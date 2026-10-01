@@ -171,6 +171,36 @@ body {
     font-size: 0.75rem;
     color: #6B7280;
 }
+/* 批量任务行：封面缩略图 + 选封面入口 */
+.task-cover-thumb {
+    width: 2.5rem;
+    height: 2.5rem;
+    flex: 0 0 auto;
+    border-radius: 0.5rem;
+    object-fit: cover;
+    background: #E5E7EB;
+}
+.task-cover-empty {
+    width: 2.5rem;
+    height: 2.5rem;
+    flex: 0 0 auto;
+    border-radius: 0.5rem;
+    background: #F9FAFB;
+    border: 1px dashed #D1D5DB;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.625rem;
+    color: #9CA3AF;
+}
+.task-cover-btn {
+    font-size: 0.75rem;
+    color: #2563EB;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    white-space: nowrap;
+}
+.task-cover-btn:hover { color: #1D4ED8; }
 .path-badge {
     display: inline-block;
     max-width: 100%;
