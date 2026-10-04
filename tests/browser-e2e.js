@@ -2938,10 +2938,116 @@ async function main() {
         );
         check('选了「不用封面」的任务确实没有封面', taskPickResult.colorB === null, JSON.stringify(taskPickResult.colorB));
 
-        // --- 31. 访问统计（GoatCounter）只在线上真的生效 ---
+        // --- 31. 手机平台的提示文案 ---
+        // 安卓 Chrome 132+ 才支持写回（MDN 兼容数据：showDirectoryPicker chrome_android=132，
+        // 而 createWritable 等句柄方法 chrome_android=109）；iOS 上所有浏览器都不支持。
+        // 以前的文案一律说"需要 Chrome / Edge"，安卓用户看了会以为是自己没装 Chrome。
+        console.log('\n[31] 手机平台提示：安卓要 132+，iOS 一律不支持写回');
+
+        const platformResult = await evaluate(pageCdp, `(() => {
+            const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36';
+            const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1';
+            const IPAD_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15';
+            const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+
+            const platforms = {
+                android: detectPlatform(ANDROID_UA, 5),
+                iphone: detectPlatform(IPHONE_UA, 5),
+                ipadDesktopMode: detectPlatform(IPAD_UA, 5),
+                realMac: detectPlatform(IPAD_UA, 0),
+                desktop: detectPlatform(DESKTOP_UA, 0)
+            };
+
+            const messages = {};
+            const dropHint = {};
+
+            // 前面的用例可能在状态行上留了"选择器失败"的常驻提示，它会盖住平台文案
+            const savedNotice = folderModeNotice;
+
+            // isSupported({supported:false}) 是纯函数、不留状态，所以要像降级用例那样替换掉它
+            const originalIsSupported = FolderFs.isSupported;
+
+            const snapshot = (key, supported, platform) => {
+                folderModeNotice = '';
+                FolderFs.isSupported = options => (options && typeof options.supported === 'boolean' ? options.supported : supported);
+                platformOverride = platform;
+
+                updateFolderSupport();
+                updateDropHint();
+
+                messages[key] = document.getElementById('folder-status').textContent;
+                dropHint[key] = !document.getElementById('folder-drop-hint').classList.contains('hidden');
+            };
+
+            try {
+                snapshot('androidUnsupported', false, 'android');
+                snapshot('iosUnsupported', false, 'ios');
+                snapshot('desktopUnsupported', false, 'desktop');
+                snapshot('androidSupported', true, 'android');
+                snapshot('desktopSupported', true, 'desktop');
+            } finally {
+                // 还原测试开关，别影响后面的用例
+                FolderFs.isSupported = originalIsSupported;
+                platformOverride = null;
+                folderModeNotice = savedNotice;
+                updateFolderSupport();
+                updateDropHint();
+            }
+
+            return {
+                platforms,
+                messages,
+                dropHint,
+                restored: document.getElementById('folder-status').textContent,
+                dropHintRestored: !document.getElementById('folder-drop-hint').classList.contains('hidden')
+            };
+        })()`);
+
+        check('能认出安卓 UA', platformResult.platforms.android === 'android', JSON.stringify(platformResult.platforms));
+        check('能认出 iPhone UA', platformResult.platforms.iphone === 'ios', JSON.stringify(platformResult.platforms));
+        check(
+            'iPad 的"桌面版网站"模式靠触摸点认出，真 Mac 不误判',
+            platformResult.platforms.ipadDesktopMode === 'ios' && platformResult.platforms.realMac === 'desktop',
+            JSON.stringify(platformResult.platforms)
+        );
+        check('桌面 Chrome 不会被误判', platformResult.platforms.desktop === 'desktop', JSON.stringify(platformResult.platforms));
+        check(
+            '安卓不支持时提示要 132+，不再说"需要 Chrome"',
+            /132/.test(platformResult.messages.androidUnsupported) && !/需要 Chrome \/ Edge/.test(platformResult.messages.androidUnsupported),
+            platformResult.messages.androidUnsupported
+        );
+        check(
+            'iOS 不支持时说明是系统限制并给出 ZIP 出路',
+            /iPhone \/ iPad/.test(platformResult.messages.iosUnsupported) && /ZIP/.test(platformResult.messages.iosUnsupported),
+            platformResult.messages.iosUnsupported
+        );
+        check(
+            '桌面非 Chromium 仍提示需要 Chrome / Edge',
+            /Chrome \/ Edge/.test(platformResult.messages.desktopUnsupported),
+            platformResult.messages.desktopUnsupported
+        );
+        check(
+            '安卓 132+ 支持时提示可直接写回并提醒性能',
+            /132 及以上支持/.test(platformResult.messages.androidSupported) && /电脑/.test(platformResult.messages.androidSupported),
+            platformResult.messages.androidSupported
+        );
+        check(
+            '桌面支持时保持原来的提示',
+            platformResult.messages.desktopSupported.includes('可直接写回原文件夹'),
+            platformResult.messages.desktopSupported
+        );
+        check(
+            '手机上才显示"没有拖拽"的引导',
+            platformResult.dropHint.androidUnsupported === true && platformResult.dropHint.iosUnsupported === true &&
+                platformResult.dropHint.desktopUnsupported === false && platformResult.dropHintRestored === false,
+            JSON.stringify(platformResult.dropHint)
+        );
+        check('测完还原成真实检测结果', !/132|iPhone/.test(platformResult.restored), platformResult.restored);
+
+        // --- 32. 访问统计（GoatCounter）只在线上真的生效 ---
         // 线上必须发出 /count 请求，否则统计数据会静默丢失；
         // 本地 file:// 则必须不发，避免开发时污染线上数据。
-        console.log('\n[31] 访问统计（GoatCounter）');
+        console.log('\n[32] 访问统计（GoatCounter）');
 
         await pageCdp.send('Network.enable');
 

@@ -60,11 +60,33 @@ python -m http.server 8080
   （比如被跳过的 `node_modules`）就整条保留，也不会虚报清理数量
 - **内容没变不重写**：LRC / 封面内容与现有文件一致时直接跳过，不动文件时间戳
 - **权限**：浏览器会为这个文件夹授权；如果写入时报权限错误，重新点一次「选择文件夹」再确认即可
-- **兼容性**：Chrome / Edge 支持完整读写；Firefox / Safari 没有 File System Access API，
-  会自动降级成「选文件夹（只读）→ 转换后打包成 ZIP 下载」，并在页面上说明原因。
+- **兼容性**：见下面的平台支持表。没有 File System Access API 的浏览器会自动降级成
+  「选文件夹（只读）→ 转换后打包成 ZIP 下载」，并在页面上说明原因。
   只读模式的包和压缩包模式一样，非 VTT 文件会原样保留在包里
 - **目录选择器打不开也不会卡住**：权限被拒、缺少用户激活或系统不支持时，会自动退回只读读入，
   转换结果打包下载，并说明失败原因——不会出现"点了没反应"
+
+### 平台支持（写回原路径）
+
+能不能写回原路径，取决于浏览器有没有 File System Access API。下表版本号取自
+[MDN 浏览器兼容数据](https://github.com/mdn/browser-compat-data)（`showDirectoryPicker` 与
+`FileSystemFileHandle.createWritable`），不是凭印象写的：
+
+| 平台 | 写回原路径 | 只读选文件夹 | 说明 |
+| --- | --- | --- | --- |
+| Chrome / Edge 桌面版 | ✅ 86+ | ✅ | 完整读写，推荐 |
+| **Android Chrome** | ✅ **132+** | ✅ 132+ | 132 以下版本只能只读；句柄写入相关 API 从 109 就有，但**选择器**要 132 才有 |
+| Android Firefox | ❌ | ✅ 142+ | 无 `showDirectoryPicker` |
+| iPhone / iPad（所有浏览器） | ❌ | ✅ Safari 18.4+ | iOS 上全是 WebKit，`showDirectoryPicker` 从未支持，属系统限制 |
+| Safari 桌面版 | ❌ | ✅ 11.1+ | Safari 26 有 `createWritable`，但仍没有目录选择器，拿不到可写句柄 |
+| Firefox 桌面版 | ❌ | ✅ | 无 `showDirectoryPicker` |
+
+**手机上怎么办**：Android Chrome 132+（2025 年 1 月起的版本）可以像电脑一样写回原路径；
+其它手机浏览器只能只读读入 → 转换结果打包成 ZIP 下载。iOS 还有一条更省事的路：
+在「文件」App 里长按作品文件夹 →「压缩」，得到 ZIP 后用「上传 ZIP」标签页处理。
+
+> 手机上的实际限制不只是浏览器：WAV 转 MP3 很吃 CPU 和内存，安卓/iOS 也可能回收后台标签页，
+> 所以**整包批量（尤其勾了平铺 + 剪掉源文件）建议在电脑上跑**。页面上也会按平台给出对应提示。
 
 > 文件夹模式只处理所选目录内的文件，不会碰 Windows 的隐藏系统目录；
 > 单个子目录读不动（权限被拒）时只跳过它并在页面上提示，不影响其余文件。
@@ -154,11 +176,12 @@ tests/browser-e2e.js     — 真实浏览器端到端测试（需要本机 Chrom
 
 ```bash
 node tests/wav-to-mp3.test.js   # 19 项：解析、位深、重采样、码率收敛、MP3 帧头
-node tests/browser-e2e.js       # 206 项：真实 Chrome 驱动页面，含真实下载解包、ID3 标签、RJ 联动（mock）、
+node tests/browser-e2e.js       # 217 项：真实 Chrome 驱动页面，含真实下载解包、ID3 标签、RJ 联动（mock）、
                                 #         文件夹扫描与写回原路径、写回确认清单、剪掉源文件、内容没变跳过、
                                 #         平铺（整树展开 + 移动文件 + 清理空目录，真假句柄各跑一遍）、
                                 #         封面裁切（拖动/缩放/复位 + 校验写进 MP3 的像素来自框选区域）、
                                 #         批量多文件夹（各任务独立封面与标签、互不干扰、一次确认、逐个手动选封面）、
+                                #         手机平台提示（安卓 132+ / iOS 不支持写回的文案）、
                                 #         只读降级、Firefox/Safari 降级入口、拖动文件夹、
                                 #         真实 File System Access 句柄、中途切标签、窄屏点击
 

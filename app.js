@@ -8,6 +8,7 @@ const panelFolder = document.getElementById('panel-folder');
 const dropZones = document.querySelectorAll('.drop-zone');
 const folderDropZone = document.getElementById('folder-drop-zone');
 const folderStatusText = document.getElementById('folder-status');
+const folderDropHint = document.getElementById('folder-drop-hint');
 const fileInputDirect = document.getElementById('file-input-direct');
 const fileInputZip = document.getElementById('file-input-zip');
 const fileInputFolder = document.getElementById('file-input-folder');
@@ -88,6 +89,7 @@ let batchParentName = ''; // 批量来源（选中的父文件夹名）
 let folderScan = null; // { vttCount, wavCount, mp3Count, imageCount, otherCount, skippedDirs, truncated }
 let modalResolver = null; // 当前等待用户回答的弹窗
 let folderModeNotice = ''; // 目录选择器失败之类的重要提示，挂在文件夹状态行上常驻显示
+let platformOverride = null; // 测试用：强制平台判断（'android' / 'ios' / 'desktop'）
 
 /**
  * RJ 元数据服务地址（Cloudflare Worker，部署方法见 worker/README.md）。
@@ -194,6 +196,7 @@ document.addEventListener('keydown', e => {
 
 updateLameStatus();
 updateFolderSupport();
+updateDropHint();
 
 // --- 基础工具函数 ---
 
@@ -363,6 +366,21 @@ function updateLameStatus() {
     }
 }
 
+/**
+ * 判断大概在什么平台上，只影响提示文案（能力一律用特性检测，不看 UA）。
+ * iPadOS 13+ 的 UA 长得和 macOS 一样，靠触摸点数区分。
+ * 参数可传入是为了测试：默认读当前浏览器。
+ */
+function detectPlatform(userAgent = navigator.userAgent || '', touchPoints = navigator.maxTouchPoints) {
+    if (platformOverride) return platformOverride;
+
+    if (/Android/i.test(userAgent)) return 'android';
+    if (/iPhone|iPad|iPod/i.test(userAgent)) return 'ios';
+    if (/Macintosh/i.test(userAgent) && touchPoints > 1) return 'ios';
+
+    return 'desktop';
+}
+
 function updateFolderSupport() {
     if (typeof FolderFs === 'undefined') {
         folderStatusText.textContent = '⚠ 文件夹模块 folder.js 未加载，无法使用文件夹模式。';
@@ -377,13 +395,33 @@ function updateFolderSupport() {
         return;
     }
 
+    const platform = detectPlatform();
+
     if (FolderFs.isSupported()) {
-        folderStatusText.textContent = '可直接写回原文件夹：转换结果覆盖原路径的同名文件，动手前会先列出清单让你确认。';
+        folderStatusText.textContent = platform === 'android'
+            ? '可直接写回原文件夹（安卓 Chrome 132 及以上支持）。动手前会先列出清单让你确认；手机上转码比电脑慢不少，批量建议在电脑上跑。'
+            : '可直接写回原文件夹：转换结果覆盖原路径的同名文件，动手前会先列出清单让你确认。';
         folderStatusText.className = 'text-xs text-gray-400 mt-2 text-center';
+        return;
+    }
+
+    // 不支持写回时，按平台说清楚"为什么"，别让安卓用户以为是自己没装 Chrome
+    if (platform === 'android') {
+        folderStatusText.textContent = '⚠ 安卓 Chrome 需要 132 及以上版本才能直接写回文件夹（当前版本太旧或不是 Chrome）。仍可选文件夹只读读入并转换，结果打包成 ZIP 下载。';
+    } else if (platform === 'ios') {
+        folderStatusText.textContent = '⚠ iPhone / iPad 上所有浏览器都不支持写回原文件夹（系统限制，非本工具问题）。可选文件夹只读读入并转换，结果打包成 ZIP 下载；或先用「文件」App 压缩成 ZIP，再到「上传 ZIP」标签页处理。';
     } else {
         folderStatusText.textContent = '⚠ 当前浏览器不支持直接写回文件夹（需要 Chrome / Edge 的 File System Access API）。仍然可以选文件夹读取并转换，结果会打包成 ZIP 下载。';
-        folderStatusText.className = 'text-xs text-amber-600 mt-2 text-center';
     }
+
+    folderStatusText.className = 'text-xs text-amber-600 mt-2 text-center';
+}
+
+/** 手机上拖拽不可用，换一句更实际的引导 */
+function updateDropHint() {
+    const isTouch = detectPlatform() !== 'desktop';
+
+    folderDropHint.classList.toggle('hidden', !isTouch);
 }
 
 // --- 页面状态 ---

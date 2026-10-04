@@ -10,7 +10,7 @@
         还在跑缓存里的旧 JS，会出现"代码明明修好了、用户还在报旧错误"的情况。
         改版本号时记得把这里和页脚一起改（端到端测试会校验两者一致）。
     -->
-    <link rel="stylesheet" href="styles.css?v=1.12.0">
+    <link rel="stylesheet" href="styles.css?v=1.12.1">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <!-- lamejs：LAME 的 JS 移植，用于把 WAV 转码成 320 kbps 的 MP3（主源失败时自动切备用源） -->
@@ -72,6 +72,7 @@
                             <span class="font-semibold text-gray-600">点击选择文件夹，或把文件夹拖进来</span>
                             <p class="text-sm text-gray-500 mt-1">直接读原文件夹：VTT 转 LRC、WAV 转 MP3、封面写进 ID3，结果覆盖写回原路径</p>
                             <p class="text-sm text-gray-500 mt-1">浏览器不支持写回时会自动改为只读读入，结果打包下载</p>
+                            <p id="folder-drop-hint" class="text-sm text-gray-400 mt-1 hidden">手机上没有拖拽，请点这里选择文件夹；iOS 也可以先用「文件」App 把文件夹压缩成 ZIP，再到「上传 ZIP」标签页处理。</p>
                         </div>
                         <p id="folder-status" class="text-xs text-gray-400 mt-2 text-center"></p>
                         <input id="file-input-folder" type="file" webkitdirectory directory multiple>
@@ -176,7 +177,7 @@
                     <span>GitHub · sulfide2085/vtt-to-lrc</span>
                 </a>
             </div>
-            <div>v1.12.0</div>
+            <div>v1.12.1</div>
         </footer>
     </div>
 
@@ -264,9 +265,9 @@
         </div>
     </div>
 
-    <script src="audio.js?v=1.12.0"></script>
-    <script src="folder.js?v=1.12.0"></script>
-    <script src="app.js?v=1.12.0"></script>
+    <script src="audio.js?v=1.12.1"></script>
+    <script src="folder.js?v=1.12.1"></script>
+    <script src="app.js?v=1.12.1"></script>
 
     <!--
         访问统计：GoatCounter
